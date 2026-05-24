@@ -293,13 +293,40 @@ class TestRuntimeLoop:
 
 class TestSystemPrompt:
     @pytest.mark.asyncio
-    async def test_system_prompt_includes_actions_and_state(self) -> None:
+    async def test_system_prompt_includes_all_standard_sections(self) -> None:
         llm = FakeLLM([Message(role=Role.ASSISTANT, content="ok")])
         runtime = _runtime(TodoWorld, llm)
         await runtime.handle(_chat_event("hi"))
 
         system_msg = llm.calls[0][0][0]
         assert system_msg.role == Role.SYSTEM
-        assert "Available Actions" in system_msg.content
+        # All four standardised sections must appear, plus our action.
+        for section in [
+            "Project Summary",
+            "Available Actions",
+            "Recent Activity",
+            "Current State",
+        ]:
+            assert section in system_msg.content, f"missing section: {section}"
         assert "add_item" in system_msg.content
-        assert "Current World State" in system_msg.content
+
+    @pytest.mark.asyncio
+    async def test_recent_activity_visible_in_subsequent_call(self) -> None:
+        """After one action, the next LLM call must see it in Recent Activity."""
+        llm = FakeLLM([
+            Message(
+                role=Role.ASSISTANT, content=None,
+                tool_calls=[ToolCall(id="c1", name="add_item", arguments={"text": "buy milk"})],
+            ),
+            Message(role=Role.ASSISTANT, content="Added."),
+        ])
+        runtime = _runtime(TodoWorld, llm)
+        await runtime.handle(_chat_event("add buy milk"))
+
+        # The second LLM call (after the tool call) should have the event log
+        # visible in its system prompt.
+        second_call_system = llm.calls[1][0][0]
+        assert "add_item" in second_call_system.content
+        assert "buy milk" in second_call_system.content
+        # And the loop-prevention guidance is on the preamble.
+        assert "Never repeat an action" in second_call_system.content

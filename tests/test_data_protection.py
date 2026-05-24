@@ -263,6 +263,51 @@ class TestDSR:
 # Phase 5 — Data Breaches                                                      #
 # --------------------------------------------------------------------------- #
 
+class TestSummaryDoc:
+    def test_summary_reflects_engagement_progress(
+        self, contracted_env: DataProtectionWorldEnvironment
+    ) -> None:
+        summary = contracted_env._namespace.read_doc("test-dp/summary.md")
+        assert summary is not None
+        # Client + scope appear
+        assert "Test Client Ltd" in summary
+        assert "GDPR audit" in summary
+        # Status is contracted
+        assert "contracted" in summary.lower()
+        # Sections exist
+        assert "## Contract" in summary
+        assert "## Privacy Policy" in summary
+
+    def test_summary_flags_open_dsrs(
+        self, contracted_env: DataProtectionWorldEnvironment
+    ) -> None:
+        contracted_env.register_data_subject(
+            name="Bob",
+            email="bob@example.com",
+            data_categories_held=["email"],
+            lawful_basis="consent",
+        )
+        contracted_env.submit_dsr("bob@example.com", DSRType.ERASURE, "delete me")
+        summary = contracted_env._namespace.read_doc("test-dp/summary.md")
+        assert summary is not None
+        assert "Data Subject Requests (1)" in summary
+        assert "open DSR" in summary
+
+    def test_summary_flags_unresolved_breach(
+        self, contracted_env: DataProtectionWorldEnvironment
+    ) -> None:
+        contracted_env.report_breach(
+            description="bucket leak",
+            data_categories_affected=["email"],
+            estimated_subjects_affected=10,
+            discovered_at=_now(),
+        )
+        summary = contracted_env._namespace.read_doc("test-dp/summary.md")
+        assert summary is not None
+        assert "Data Breaches (1)" in summary
+        assert "open breach" in summary
+
+
 class TestDataBreach:
     @pytest.fixture
     def env_with_breach(

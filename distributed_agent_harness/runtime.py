@@ -35,13 +35,24 @@ DEFAULT_SYSTEM_PREAMBLE = """\
 You are an agent operating on a shared, audited project state via a fixed
 set of actions. Each action mutates the project's persisted state.
 
+The sections below give you everything you need:
+
+- **Project Summary** — the high-level "card view" of where the project stands.
+  Start here. It is the authoritative human-readable narrative.
+- **Available Actions** — the only operations you may call. You have no shell
+  access and may not invent actions outside this list.
+- **Recent Activity** — the last actions taken on this project. Read this
+  carefully before acting. If you see you have just done something, do not do
+  it again — either move on or report back to the user.
+- **Current State** — exact machine values (IDs, timestamps, enums) for when
+  you need precise arguments for an action.
+
 Rules:
-- Use ONLY the actions listed under "Available Actions". You have no shell access.
-- The current project state is shown under "Current World State". It is the
-  authoritative source of truth.
 - Call as many actions as you need to satisfy the user's request, then respond
   with a final plain-text message (no further tool calls) summarising what you did.
 - If you do not have enough information to act safely, ask the user instead of guessing.
+- Never repeat an action that already appears in Recent Activity with the same arguments
+  unless the user has explicitly asked you to redo it.
 """
 
 
@@ -93,21 +104,36 @@ class AgentRuntime:
         Builds an agent loop, dispatches tool calls to WorldEnvironment
         actions, streams events to ``event.reply_to`` if present, and returns
         the final assistant message.
+
+        The system prompt is **rebuilt before every LLM call** so that the
+        Project Summary, Recent Activity, and Current State sections always
+        reflect the latest namespace contents — including actions taken
+        earlier in this very run. This is the key mechanism for in-run
+        loop prevention.
         """
         world = self.world_class(
             project_id=event.project_id,
             namespace=self.namespace,
             concurrency=self.concurrency,
         )
-        messages = self._initial_messages(world, event)
         reply_to = event.reply_to
 
+        user_message = self._user_message_for(event)
+        # The conversation grows with each assistant/tool turn. The system
+        # prompt is regenerated fresh on every iteration and prepended.
+        conversation: list[Message] = []
         final: Message = Message(role=Role.ASSISTANT, content="")
 
         try:
             for _ in range(self.max_iterations):
+                # Refresh world state from the namespace so the system prompt
+                # reflects mutations from the previous tool calls (or other agents).
+                world._hydrate()
+                system_message = self._build_system_message(world)
+                messages = [system_message, user_message, *conversation]
+
                 assistant = await self.llm.chat_complete(messages, tools=self._tool_schemas)
-                messages.append(assistant)
+                conversation.append(assistant)
 
                 if not assistant.tool_calls:
                     final = assistant
@@ -118,10 +144,10 @@ class AgentRuntime:
                         ))
                     break
 
-                # Execute each tool call and append results
+                # Execute each tool call and append results to the conversation
                 for call in assistant.tool_calls:
                     result_message = await self._execute_call(call, world, reply_to)
-                    messages.append(result_message)
+                    conversation.append(result_message)
             else:
                 # Hit max_iterations without a final message
                 if reply_to:
@@ -147,30 +173,24 @@ class AgentRuntime:
     # Internals                                                                #
     # ----------------------------------------------------------------------- #
 
-    def _initial_messages(
-        self, world: BaseWorldEnvironment, event: TriggerEvent
-    ) -> list[Message]:
-        system_content = (
-            self.system_preamble
-            + "\n\n"
-            + self._builder.build_full_prompt(world)
-        )
-        messages = [Message(role=Role.SYSTEM, content=system_content)]
+    def _build_system_message(self, world: BaseWorldEnvironment) -> Message:
+        """Build a fresh system message reflecting the world's current state."""
+        content = self.system_preamble + "\n\n" + self._builder.build_full_prompt(world)
+        return Message(role=Role.SYSTEM, content=content)
 
-        # Convert the trigger payload into a user message. Chat messages have
-        # 'text'; other trigger kinds get a structured description.
+    @staticmethod
+    def _user_message_for(event: TriggerEvent) -> Message:
+        """Convert a TriggerEvent into a user-role message for the LLM."""
         text = event.payload.get("text")
         if text:
-            messages.append(Message(role=Role.USER, content=text))
-        else:
-            messages.append(Message(
-                role=Role.USER,
-                content=(
-                    f"Trigger received from '{event.source}' of kind "
-                    f"'{event.kind.value}'. Payload: {event.payload}"
-                ),
-            ))
-        return messages
+            return Message(role=Role.USER, content=text)
+        return Message(
+            role=Role.USER,
+            content=(
+                f"Trigger received from '{event.source}' of kind "
+                f"'{event.kind.value}'. Payload: {event.payload}"
+            ),
+        )
 
     async def _execute_call(
         self,

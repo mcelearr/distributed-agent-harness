@@ -86,6 +86,110 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     State = DataProtectionState
 
     # ----------------------------------------------------------------------- #
+    # Summary rendering — domain-specific "card view"                          #
+    # ----------------------------------------------------------------------- #
+
+    def render_summary(self) -> str:
+        """
+        Produce the narrative summary that lives at ``<project>/summary.md``.
+
+        Designed for a partner or compliance officer to read at a glance:
+        engagement status, the live privacy policy, current data subjects,
+        and the state of any open DSRs or breaches.
+        """
+        s = self.state
+        client_line = (
+            f"**{s.client.name}** — {s.client.industry}"
+            if s.client
+            else "_no client on record_"
+        )
+
+        lines: list[str] = [
+            f"# Data Protection Engagement — {s.client.name if s.client else '(unnamed)'}",
+            "",
+            f"**Status:** `{s.status.value}`",
+            f"**Client:** {client_line}",
+        ]
+        if s.client:
+            lines.append(f"**Scope:** {s.client.scope_of_work}")
+
+        # Contract
+        lines.append("")
+        lines.append("## Contract")
+        if s.contract:
+            fee = (
+                f"£{s.contract.retainer_fee_gbp:,.0f}/month retainer"
+                if s.contract.retainer_fee_gbp is not None
+                else "no retainer recorded"
+            )
+            lines.append(
+                f"- Signed {s.contract.signed_date:%Y-%m-%d} — {fee}"
+            )
+            lines.append(
+                f"- DPA included: **{'yes' if s.contract.dpa_included else 'no'}**"
+            )
+        else:
+            lines.append("_no contract yet_")
+
+        # Privacy policies
+        lines.append("")
+        lines.append("## Privacy Policy")
+        if s.privacy_policies:
+            for p in s.privacy_policies:
+                lines.append(f"- v{p.version} — `{p.status.value}`")
+        else:
+            lines.append("_no policy drafted_")
+
+        # Data subjects
+        active = [ds for ds in s.data_subjects if not ds.erased]
+        erased = [ds for ds in s.data_subjects if ds.erased]
+        lines.append("")
+        lines.append(f"## Data Subjects ({len(s.data_subjects)})")
+        lines.append(f"- {len(active)} active, {len(erased)} erased")
+
+        # DSRs
+        if s.data_subject_requests:
+            open_dsrs = [
+                r for r in s.data_subject_requests
+                if r.status not in (DSRStatus.COMPLETED, DSRStatus.REFUSED)
+            ]
+            lines.append("")
+            lines.append(f"## Data Subject Requests ({len(s.data_subject_requests)})")
+            for r in s.data_subject_requests:
+                deadline = (
+                    f", deadline {r.deadline:%Y-%m-%d}"
+                    if r.deadline
+                    else ""
+                )
+                lines.append(
+                    f"- `{r.id}` — {r.request_type.value} from {r.subject_email} "
+                    f"— `{r.status.value}`{deadline}"
+                )
+            if open_dsrs:
+                lines.append("")
+                lines.append(f"_Note: {len(open_dsrs)} open DSR(s) require action._")
+
+        # Breaches
+        if s.data_breaches:
+            open_breaches = [
+                b for b in s.data_breaches if b.status != BreachStatus.RESOLVED
+            ]
+            lines.append("")
+            lines.append(f"## Data Breaches ({len(s.data_breaches)})")
+            for b in s.data_breaches:
+                sev = b.severity.value if b.severity else "unassessed"
+                ico = f", ICO ref {b.ico_reference}" if b.ico_reference else ""
+                lines.append(
+                    f"- `{b.id}` — {sev}, `{b.status.value}` "
+                    f"({b.estimated_subjects_affected} subjects affected){ico}"
+                )
+            if open_breaches:
+                lines.append("")
+                lines.append(f"_Note: {len(open_breaches)} open breach(es) require action._")
+
+        return "\n".join(lines) + "\n"
+
+    # ----------------------------------------------------------------------- #
     # Phase 1 — Engagement                                                     #
     # ----------------------------------------------------------------------- #
 

@@ -212,7 +212,21 @@ def main() -> None:
         print(f"  {path}")
 
     print("\n" + "=" * 70)
-    print("AUDIT LOG")
+    print("summary.md  (what the agent and humans see at a glance)")
+    print("=" * 70)
+    summary_raw = namespace.read_doc("acme-gdpr-2025/summary.md")
+    if summary_raw:
+        print(summary_raw)
+
+    print("\n" + "=" * 70)
+    print("event_log.md  (human-readable history; tail lifted into agent prompt)")
+    print("=" * 70)
+    event_log_raw = namespace.read_doc("acme-gdpr-2025/event_log.md")
+    if event_log_raw:
+        print(event_log_raw)
+
+    print("=" * 70)
+    print("audit.jsonl  (machine-parseable, one entry per action)")
     print("=" * 70)
     audit_raw = namespace.read_doc("acme-gdpr-2025/audit.jsonl")
     if audit_raw:
