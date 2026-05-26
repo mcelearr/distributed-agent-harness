@@ -22,6 +22,7 @@ from typing import Any, Type
 from pydantic import ValidationError, create_model
 
 from .concurrency import ConcurrencyHandler
+from .hooks import ActionContext, BlockDecision, HookRegistry
 from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
@@ -82,6 +83,7 @@ class AgentRuntime:
         max_iterations: int = 12,
         system_preamble: str = DEFAULT_SYSTEM_PREAMBLE,
         include_source_in_prompt: bool = True,
+        hooks: HookRegistry | None = None,
     ) -> None:
         self.world_class = world_class
         self.namespace = namespace
@@ -89,9 +91,34 @@ class AgentRuntime:
         self.llm = llm
         self.max_iterations = max_iterations
         self.system_preamble = system_preamble
+        self.hooks = hooks if hooks is not None else HookRegistry()
         self._builder = PromptBuilder(world_class, include_source=include_source_in_prompt)
         # Cache tool schemas — they're derived from class definitions, not state
         self._tool_schemas, self._param_models = _build_tool_schemas(world_class)
+
+    # ----------------------------------------------------------------------- #
+    # Convenience hook registration — delegate to self.hooks                   #
+    # ----------------------------------------------------------------------- #
+
+    def on_pre_action(self, action: str | None = None):
+        """Register a pre-action hook. See ``HookRegistry.on_pre_action``."""
+        return self.hooks.on_pre_action(action)
+
+    def on_post_action(self, action: str | None = None):
+        """Register a post-action hook. See ``HookRegistry.on_post_action``."""
+        return self.hooks.on_post_action(action)
+
+    def on_action_error(self, action: str | None = None):
+        """Register an action-error hook. See ``HookRegistry.on_action_error``."""
+        return self.hooks.on_action_error(action)
+
+    def on_pre_trigger(self, fn):
+        """Register a pre-trigger hook. See ``HookRegistry.on_pre_trigger``."""
+        return self.hooks.on_pre_trigger(fn)
+
+    def on_run_complete(self, fn):
+        """Register a run-complete hook. See ``HookRegistry.on_run_complete``."""
+        return self.hooks.on_run_complete(fn)
 
     # ----------------------------------------------------------------------- #
     # Public entry point                                                       #
@@ -110,19 +137,39 @@ class AgentRuntime:
         reflect the latest namespace contents — including actions taken
         earlier in this very run. This is the key mechanism for in-run
         loop prevention.
+
+        Hook lifecycle (in firing order):
+            pre_trigger → [ pre_action → action → post_action ]* → run_complete
         """
+        reply_to = event.reply_to
+        final: Message = Message(role=Role.ASSISTANT, content="")
+
+        # ----- pre_trigger: gate the whole run before we even instantiate the world
+        decision = await self.hooks.fire_pre_trigger(event)
+        if decision is not None:
+            final = Message(
+                role=Role.ASSISTANT,
+                content=f"[trigger blocked] {decision.reason}",
+            )
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ERROR,
+                    payload={"error": f"Trigger blocked: {decision.reason}"},
+                ))
+                await reply_to.emit(OutputEvent(kind=OutputEventKind.FINAL))
+            await self.hooks.fire_run_complete(event, final)
+            return final
+
         world = self.world_class(
             project_id=event.project_id,
             namespace=self.namespace,
             concurrency=self.concurrency,
         )
-        reply_to = event.reply_to
 
         user_message = self._user_message_for(event)
         # The conversation grows with each assistant/tool turn. The system
         # prompt is regenerated fresh on every iteration and prepended.
         conversation: list[Message] = []
-        final: Message = Message(role=Role.ASSISTANT, content="")
 
         try:
             for _ in range(self.max_iterations):
@@ -146,7 +193,7 @@ class AgentRuntime:
 
                 # Execute each tool call and append results to the conversation
                 for call in assistant.tool_calls:
-                    result_message = await self._execute_call(call, world, reply_to)
+                    result_message = await self._execute_call(call, world, reply_to, event)
                     conversation.append(result_message)
             else:
                 # Hit max_iterations without a final message
@@ -166,6 +213,9 @@ class AgentRuntime:
         finally:
             if reply_to:
                 await reply_to.emit(OutputEvent(kind=OutputEventKind.FINAL))
+            # run_complete fires regardless of how the run ended — success,
+            # block, max_iterations, or exception in the loop body.
+            await self.hooks.fire_run_complete(event, final)
 
         return final
 
@@ -197,6 +247,7 @@ class AgentRuntime:
         call: ToolCall,
         world: BaseWorldEnvironment,
         reply_to: Any,
+        trigger: TriggerEvent,
     ) -> Message:
         """Run one tool call against the WorldEnvironment and return a TOOL message."""
         if reply_to:
@@ -243,10 +294,41 @@ class AgentRuntime:
                 name=call.name,
             )
 
+        # Build the context that every action-level hook receives.
+        ctx = ActionContext(
+            project_id=world._project_id,
+            action_name=call.name,
+            args=(),
+            kwargs=kwargs,
+            trigger=trigger,
+        )
+
+        # ----- pre_action: blocking hooks may halt the call
+        decision = await self.hooks.fire_pre_action(ctx)
+        if decision is not None:
+            error = f"Action blocked: {decision.reason}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={
+                        "name": call.name,
+                        "id": call.id,
+                        "error": error,
+                        "blocked": True,
+                    },
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+
         # The @action wrapper handles its own locking; we offload to a thread
         # so we don't block the event loop.
         try:
             result = await asyncio.to_thread(method, **kwargs)
+            await self.hooks.fire_post_action(ctx, result)
             result_text = _stringify_result(result)
             if reply_to:
                 await reply_to.emit(OutputEvent(
@@ -260,6 +342,7 @@ class AgentRuntime:
                 name=call.name,
             )
         except Exception as exc:  # noqa: BLE001 — must surface to the LLM
+            await self.hooks.fire_action_error(ctx, exc)
             error = f"{type(exc).__name__}: {exc}"
             if reply_to:
                 await reply_to.emit(OutputEvent(

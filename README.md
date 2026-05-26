@@ -36,6 +36,7 @@ graph TD
 
     subgraph HarnessCore["Harness Core"]
         PB["Prompt Builder"]
+        HOOKS["Hook Registry — pre_action / post_action / action_error / pre_trigger / run_complete"]
         IMPL["UserWorldEnvironment"]
         BASE["BaseWorldEnvironment"]
         IMPL -. "inherits" .-> BASE
@@ -164,7 +165,49 @@ The Prompt Builder also injects the **current state** of the World Environment s
 
 ---
 
-#### 4. Concurrency Handler *(pluggable distributed coordination)*
+#### 4. Lifecycle Hooks *(pluggable Python callables)*
+
+Hooks are async Python callables that fire at well-defined points in the agent runtime. They are the harness equivalent of Claude Code's hooks — but in-process, typed, and async, since we don't need a serialisation boundary.
+
+Five events are supported:
+
+| Event | Fires | Can block? |
+|---|---|---|
+| `pre_action(action_name=None)` | Before an `@action` runs | **Yes** — return `BlockDecision(reason=...)` |
+| `post_action(action_name=None)` | After an `@action` returns successfully | No |
+| `action_error(action_name=None)` | When an `@action` raises | No |
+| `pre_trigger` | When a `TriggerEvent` is received | **Yes** — blocks the whole run |
+| `run_complete` | When an agent run finishes (any path) | No |
+
+Hooks attached to a specific action name fire only for that action; hooks attached without a name (or with `None`) fire for every action. Specific hooks run before wildcard hooks so they can block first.
+
+**Approval gate example:**
+
+```python
+from distributed_agent_harness import AgentRuntime, ActionContext, BlockDecision
+
+runtime = AgentRuntime(...)
+
+@runtime.on_pre_action("notify_ico")
+async def require_partner_signoff(ctx: ActionContext) -> BlockDecision | None:
+    if not await partner_approves(ctx.project_id, ctx.kwargs):
+        return BlockDecision(reason="Awaiting partner sign-off before ICO notification")
+
+@runtime.on_post_action("report_breach")
+async def notify_partners_on_slack(ctx: ActionContext, result) -> None:
+    await slack.post(
+        channel="#data-protection",
+        text=f"Breach reported on {ctx.project_id}: {result.description}",
+    )
+
+@runtime.on_action_error()  # fires for ANY action that raises
+async def alert_oncall(ctx: ActionContext, exc: BaseException) -> None:
+    await pagerduty.trigger(summary=f"{ctx.action_name} failed: {exc}")
+```
+
+A blocked action is surfaced to the LLM as a TOOL message containing the reason — the agent then has the opportunity to explain the block to the user or take a different action. Blocked triggers short-circuit the whole run with an ERROR event on the OutputChannel.
+
+#### 5. Concurrency Handler *(pluggable distributed coordination)*
 
 The Concurrency Handler sits between `BaseWorldEnvironment` and the Namespace. Its job is to ensure that concurrent method calls from multiple agents or humans do not corrupt the shared state.
 

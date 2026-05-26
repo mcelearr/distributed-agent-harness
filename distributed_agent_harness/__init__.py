@@ -1,6 +1,16 @@
 """Distributed Agent Harness — shared, auditable world state for multi-agent systems."""
 
 from .concurrency import ConcurrencyHandler
+from .hooks import (
+    ActionContext,
+    ActionErrorHook,
+    BlockDecision,
+    HookRegistry,
+    PostActionHook,
+    PreActionHook,
+    PreTriggerHook,
+    RunCompleteHook,
+)
 from .llm import (
     CompletionChunk,
     LLMProvider,
@@ -43,6 +53,15 @@ __all__ = [
     "OutputEvent",
     "OutputEventKind",
     "OutputChannel",
+    # Hooks
+    "HookRegistry",
+    "ActionContext",
+    "BlockDecision",
+    "PreActionHook",
+    "PostActionHook",
+    "ActionErrorHook",
+    "PreTriggerHook",
+    "RunCompleteHook",
     # Runtime
     "AgentRuntime",
 ]
