@@ -30,12 +30,14 @@ from .transport import (
     TriggerKind,
     TriggerSource,
 )
-from .world import BaseWorldEnvironment, action
+from .world import BaseWorldEnvironment, Predicate, PreconditionViolation, action
 
 __all__ = [
     # Core
     "BaseWorldEnvironment",
     "action",
+    "Predicate",
+    "PreconditionViolation",
     "NamespaceAdapter",
     "ConcurrencyHandler",
     "PromptBuilder",

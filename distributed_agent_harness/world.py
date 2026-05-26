@@ -11,12 +11,43 @@ import inspect
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, ClassVar, Type
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Type
 
 from pydantic import BaseModel
 
 from .concurrency import ConcurrencyHandler
 from .namespace import NamespaceAdapter
+
+if TYPE_CHECKING:
+    from .transport import TriggerEvent
+
+
+# Predicate signature used by both ``precondition`` and ``relevance``.
+# Predicates receive the current state and the originating TriggerEvent
+# (or None when called outside an AgentRuntime).
+Predicate = Callable[[BaseModel, "TriggerEvent | None"], bool]
+
+
+# --------------------------------------------------------------------------- #
+# PreconditionViolation — raised by the @action wrapper when a hard predicate  #
+# returns False. The AgentRuntime catches it and surfaces a blocking TOOL      #
+# message to the LLM (same shape as a pre_action hook BlockDecision).          #
+# --------------------------------------------------------------------------- #
+
+class PreconditionViolation(Exception):
+    """
+    Raised by an @action wrapper when its ``precondition`` predicate
+    returns False (or raises).
+
+    The AgentRuntime catches this specifically and surfaces a TOOL message
+    with ``blocked=True`` to the LLM, rather than treating it as a generic
+    action failure. This way the agent learns "I cannot do this now" instead
+    of "this crashed."
+    """
+    def __init__(self, action_name: str, reason: str) -> None:
+        self.action_name = action_name
+        self.reason = reason
+        super().__init__(f"{action_name}: {reason}")
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +76,12 @@ def _format_args_for_log(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
 # @action decorator                                                             #
 # --------------------------------------------------------------------------- #
 
-def action(method: Any) -> Any:
+def action(
+    method: Any = None,
+    *,
+    precondition: Predicate | None = None,
+    relevance: Predicate | None = None,
+) -> Any:
     """
     Decorator that marks a WorldEnvironment method as an auditable agent action.
 
@@ -53,51 +89,114 @@ def action(method: Any) -> Any:
 
         1. Acquire an exclusive lock on the project namespace
         2. Read the latest state from the namespace (never operates on stale data)
-        3. Execute the method body
-        4. Flush the updated state back to the namespace
-        5. Append an entry to the append-only audit log
-        6. Release the lock (even on failure)
+        3. Evaluate the ``precondition`` predicate (if set); raise
+           PreconditionViolation when it returns False
+        4. Execute the method body
+        5. Flush the updated state back to the namespace
+        6. Append an entry to the append-only audit log
+        7. Release the lock (even on failure)
 
     The original source code is preserved on the wrapper as ``._source`` so
     the PromptBuilder can surface it to the LLM.
 
+    Parameters
+    ----------
+    precondition: Predicate | None
+        A callable ``(state, event) -> bool`` that MUST return True for the
+        action to run. When False, the action is hidden from the system
+        prompt entirely AND any attempt to invoke it raises
+        ``PreconditionViolation`` (surfaced as a blocking TOOL message to
+        the LLM). Use this for hard contracts: "this action cannot
+        legitimately run in this state."
+
+    relevance: Predicate | None
+        A callable ``(state, event) -> bool`` that signals whether the
+        action is currently in scope. When False, the action is demoted to
+        the "Latent" prompt tier (manifest line only, full body not
+        included). Never blocks at runtime. Use this for soft hints: "this
+        action is technically callable but probably not what you want
+        right now."
+
+    Both predicates receive the current ``state`` and the originating
+    ``TriggerEvent`` (or None when called outside an AgentRuntime).
+
     Usage::
 
-        class MyWorld(BaseWorldEnvironment):
-            State = MyState
+        # Always active, always callable.
+        @action
+        def do_something(self, value: str) -> str:
+            ...
 
-            @action
-            def do_something(self, value: str) -> str:
-                \"\"\"A clear docstring describing what this action does.\"\"\"
-                self.state.things.append(value)
-                return value
+        # Soft hint — visible but not prominent when the predicate is False.
+        @action(relevance=lambda s, e: bool(s.open_breaches))
+        def notify_ico(self, ...): ...
+
+        # Hard gate — hidden and blocked when the predicate is False.
+        @action(precondition=lambda s, e: s.status == "contracted")
+        def draft_privacy_policy(self, ...): ...
+
+        # Both compose — hard contract plus relevance signal.
+        @action(
+            precondition=lambda s, e: s.contract is not None,
+            relevance=lambda s, e: any(
+                b.is_notifiable and b.ico_notified_at is None
+                for b in s.data_breaches
+            ),
+        )
+        def notify_ico(self, ...): ...
     """
-    # Capture source before wrapping — inspect cannot retrieve source of a closure
-    try:
-        source = inspect.getsource(method)
-    except OSError:
-        source = ""
-
-    @functools.wraps(method)
-    def wrapper(self: "BaseWorldEnvironment", *args: Any, **kwargs: Any) -> Any:
-        resource_id = self._project_id
-        self._concurrency.acquire_lock(resource_id)
+    def decorator(target_method: Any) -> Any:
+        # Capture source before wrapping — inspect cannot retrieve source of a closure
         try:
-            # Always read the latest persisted state before executing
-            self._hydrate()
-            result = method(self, *args, **kwargs)
-            self._flush()
-            self._write_audit(method.__name__, args, kwargs, result=result)
-            return result
-        except Exception as exc:
-            self._write_audit(method.__name__, args, kwargs, error=str(exc))
-            raise
-        finally:
-            self._concurrency.release_lock(resource_id)
+            source = inspect.getsource(target_method)
+        except OSError:
+            source = ""
 
-    wrapper._is_action = True   # type: ignore[attr-defined]
-    wrapper._source = source    # type: ignore[attr-defined]
-    return wrapper
+        @functools.wraps(target_method)
+        def wrapper(self: "BaseWorldEnvironment", *args: Any, **kwargs: Any) -> Any:
+            resource_id = self._project_id
+            self._concurrency.acquire_lock(resource_id)
+            try:
+                # Always read the latest persisted state before executing.
+                self._hydrate()
+
+                # Evaluate the precondition against fresh state + ambient trigger.
+                if precondition is not None:
+                    event = getattr(self, "_pending_trigger", None)
+                    try:
+                        ok = bool(precondition(self.state, event))
+                    except Exception as exc:  # noqa: BLE001
+                        raise PreconditionViolation(
+                            target_method.__name__,
+                            f"precondition raised "
+                            f"{type(exc).__name__}: {exc}",
+                        ) from exc
+                    if not ok:
+                        raise PreconditionViolation(
+                            target_method.__name__,
+                            "precondition not satisfied for the current state",
+                        )
+
+                result = target_method(self, *args, **kwargs)
+                self._flush()
+                self._write_audit(target_method.__name__, args, kwargs, result=result)
+                return result
+            except Exception as exc:
+                self._write_audit(target_method.__name__, args, kwargs, error=str(exc))
+                raise
+            finally:
+                self._concurrency.release_lock(resource_id)
+
+        wrapper._is_action = True               # type: ignore[attr-defined]
+        wrapper._source = source                # type: ignore[attr-defined]
+        wrapper._precondition = precondition    # type: ignore[attr-defined]
+        wrapper._relevance = relevance          # type: ignore[attr-defined]
+        return wrapper
+
+    # Support both bare ``@action`` and parameterised ``@action(precondition=fn)``.
+    if method is None:
+        return decorator
+    return decorator(method)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +269,10 @@ class BaseWorldEnvironment:
         self._project_id = project_id
         self._namespace = namespace
         self._concurrency = concurrency
+        # The AgentRuntime sets this before each @action call so the wrapper
+        # can pass it to ``precondition`` / ``relevance`` predicates. Outside
+        # the runtime (direct calls, scripts, tests) it stays None.
+        self._pending_trigger: "TriggerEvent | None" = None
         # Initialise with defaults; _hydrate will overwrite if a persisted state exists
         self.state: BaseModel = self.__class__.State()
         self._hydrate()

@@ -165,7 +165,44 @@ The Prompt Builder also injects the **current state** of the World Environment s
 
 ---
 
-#### 4. Lifecycle Hooks *(pluggable Python callables)*
+#### 4. Action Discovery & Scaling *(precondition + relevance predicates)*
+
+Every `@action` accepts two optional predicates that control how the action appears to the agent and whether it can run. Both have signature `(state, event) -> bool` where `event` is the triggering `TriggerEvent` (or `None` outside a runtime).
+
+| Predicate | When false → | Use for |
+|---|---|---|
+| `precondition` | **Hidden** from the prompt *and* blocked at runtime with `PreconditionViolation` | Hard contracts: "this action cannot legitimately run in this state" |
+| `relevance` | Demoted to the **Latent** prompt tier (manifest line only) | Soft hints: "this exists but is probably not what you want right now" |
+
+Both predicates compose. They run against the freshly-hydrated state every iteration, so as the world changes the action partitioning updates automatically.
+
+**Example — the full vocabulary on one action:**
+```python
+@action(
+    # Hard contract: cannot run before contract is signed.
+    precondition=lambda state, event: state.status == EngagementStatus.CONTRACTED,
+    # Soft hint: only "active" when there's a notifiable unnotified breach.
+    relevance=lambda state, event: any(
+        b.is_notifiable and b.ico_notified_at is None
+        for b in state.data_breaches
+    ),
+)
+def notify_ico(self, breach_id: str, ...): ...
+```
+
+**Three prompt tiers, generated automatically:**
+
+| Tier | Content per action | Triggered by |
+|---|---|---|
+| **Active** | Full signature + docstring + (optional) source | precondition true AND relevance true-or-unset |
+| **Latent** | Manifest line: `name(params) — first line of docstring` | precondition true AND relevance is set but false |
+| **Hidden** | (not shown to the model) | precondition is set and false |
+
+The `PreconditionViolation` raised by a blocked action is caught by the `AgentRuntime` and surfaced to the LLM as a TOOL message with `blocked=True`, identical in shape to a blocked `pre_action` hook decision. The agent learns "I can't do this now" rather than crashing.
+
+For very large action sets, future work will add `search_actions(query)` and `describe_action(name)` meta-actions to allow on-demand discovery of Latent actions. With current world sizes (~15 actions) the two-tier partitioning is sufficient.
+
+#### 5. Lifecycle Hooks *(pluggable Python callables)*
 
 Hooks are async Python callables that fire at well-defined points in the agent runtime. They are the harness equivalent of Claude Code's hooks — but in-process, typed, and async, since we don't need a serialisation boundary.
 
@@ -207,7 +244,7 @@ async def alert_oncall(ctx: ActionContext, exc: BaseException) -> None:
 
 A blocked action is surfaced to the LLM as a TOOL message containing the reason — the agent then has the opportunity to explain the block to the user or take a different action. Blocked triggers short-circuit the whole run with an ERROR event on the OutputChannel.
 
-#### 5. Concurrency Handler *(pluggable distributed coordination)*
+#### 6. Concurrency Handler *(pluggable distributed coordination)*
 
 The Concurrency Handler sits between `BaseWorldEnvironment` and the Namespace. Its job is to ensure that concurrent method calls from multiple agents or humans do not corrupt the shared state.
 

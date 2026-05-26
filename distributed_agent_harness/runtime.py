@@ -27,7 +27,7 @@ from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
-from .world import BaseWorldEnvironment
+from .world import BaseWorldEnvironment, PreconditionViolation
 
 log = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ class AgentRuntime:
                 # Refresh world state from the namespace so the system prompt
                 # reflects mutations from the previous tool calls (or other agents).
                 world._hydrate()
-                system_message = self._build_system_message(world)
+                system_message = self._build_system_message(world, event=event)
                 messages = [system_message, user_message, *conversation]
 
                 assistant = await self.llm.chat_complete(messages, tools=self._tool_schemas)
@@ -223,9 +223,17 @@ class AgentRuntime:
     # Internals                                                                #
     # ----------------------------------------------------------------------- #
 
-    def _build_system_message(self, world: BaseWorldEnvironment) -> Message:
+    def _build_system_message(
+        self,
+        world: BaseWorldEnvironment,
+        event: TriggerEvent | None = None,
+    ) -> Message:
         """Build a fresh system message reflecting the world's current state."""
-        content = self.system_preamble + "\n\n" + self._builder.build_full_prompt(world)
+        content = (
+            self.system_preamble
+            + "\n\n"
+            + self._builder.build_full_prompt(world, event=event)
+        )
         return Message(role=Role.SYSTEM, content=content)
 
     @staticmethod
@@ -324,6 +332,11 @@ class AgentRuntime:
                 name=call.name,
             )
 
+        # Stash the trigger on the world so the @action wrapper can pass it
+        # to ``precondition`` / ``relevance`` predicates. Cleared in the
+        # ``finally`` even on error so direct callers never see a stale value.
+        world._pending_trigger = trigger
+
         # The @action wrapper handles its own locking; we offload to a thread
         # so we don't block the event loop.
         try:
@@ -341,6 +354,27 @@ class AgentRuntime:
                 tool_call_id=call.id,
                 name=call.name,
             )
+        except PreconditionViolation as exc:
+            # Hard-precondition violations get the same shape as a blocked
+            # pre_action hook: the LLM sees a clear "this is not allowed
+            # right now" message and can adapt rather than thrashing.
+            error = f"Action blocked: {exc.reason}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={
+                        "name": call.name,
+                        "id": call.id,
+                        "error": error,
+                        "blocked": True,
+                    },
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
         except Exception as exc:  # noqa: BLE001 — must surface to the LLM
             await self.hooks.fire_action_error(ctx, exc)
             error = f"{type(exc).__name__}: {exc}"
@@ -355,6 +389,8 @@ class AgentRuntime:
                 tool_call_id=call.id,
                 name=call.name,
             )
+        finally:
+            world._pending_trigger = None
 
 
 # --------------------------------------------------------------------------- #

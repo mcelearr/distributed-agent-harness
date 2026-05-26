@@ -193,7 +193,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # Phase 1 — Engagement                                                     #
     # ----------------------------------------------------------------------- #
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+    )
     def submit_pitch(
         self,
         client_name: str,
@@ -219,7 +221,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         self.state.status = EngagementStatus.PITCH
         return client
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+    )
     def win_pitch(
         self,
         terms_summary: str,
@@ -233,11 +237,8 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         Agreement (DPA) is included as standard under UK GDPR Art. 28.
         submit_pitch() must have been called first.
         """
-        if self.state.status != EngagementStatus.PITCH:
-            raise ValueError(
-                f"Can only win a pitch when status is PITCH "
-                f"(current: {self.state.status})"
-            )
+        # The PITCH-state precondition is enforced by the decorator.
+        # We still need to ensure a client was actually recorded.
         if not self.state.client:
             raise ValueError("No client on record — call submit_pitch() first")
 
@@ -252,7 +253,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         self.state.status = EngagementStatus.CONTRACTED
         return contract
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+    )
     def lose_pitch(self, reason: str) -> None:
         """
         Record that the pitch was unsuccessful and close the engagement.
@@ -266,7 +269,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # Phase 2 — Privacy Policy                                                 #
     # ----------------------------------------------------------------------- #
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+    )
     def draft_privacy_policy(
         self,
         version: str,
@@ -285,10 +290,6 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         processing_purposes: reasons for processing, e.g. ["payroll", "marketing"]
         retention_periods: mapping of category to retention duration, e.g. {"email": "3 years"}
         """
-        if self.state.status != EngagementStatus.CONTRACTED:
-            raise ValueError(
-                "Cannot draft a privacy policy before the engagement is contracted"
-            )
         policy = PrivacyPolicy(
             version=version,
             content=content,
@@ -340,7 +341,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # Phase 3 — Data Subjects                                                  #
     # ----------------------------------------------------------------------- #
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+    )
     def register_data_subject(
         self,
         name: str,
@@ -372,7 +375,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # Phase 4 — Data Subject Requests                                          #
     # ----------------------------------------------------------------------- #
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+    )
     def submit_dsr(
         self,
         subject_email: str,
@@ -407,7 +412,11 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         self.state.data_subject_requests.append(dsr)
         return dsr
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            r.status == DSRStatus.SUBMITTED for r in s.data_subject_requests
+        ),
+    )
     def acknowledge_dsr(self, dsr_id: str) -> DataSubjectRequest:
         """
         Confirm receipt of a Data Subject Request.
@@ -425,7 +434,12 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         dsr.acknowledged_at = _now()
         return dsr
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            r.status in (DSRStatus.SUBMITTED, DSRStatus.IN_PROGRESS)
+            for r in s.data_subject_requests
+        ),
+    )
     def complete_dsr(
         self,
         dsr_id: str,
@@ -468,7 +482,12 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
 
         return dsr
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            r.status in (DSRStatus.SUBMITTED, DSRStatus.IN_PROGRESS)
+            for r in s.data_subject_requests
+        ),
+    )
     def refuse_dsr(
         self,
         dsr_id: str,
@@ -496,7 +515,9 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # Phase 5 — Data Breaches                                                  #
     # ----------------------------------------------------------------------- #
 
-    @action
+    @action(
+        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+    )
     def report_breach(
         self,
         description: str,
@@ -526,7 +547,11 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         self.state.data_breaches.append(breach)
         return breach
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            b.status == BreachStatus.REPORTED for b in s.data_breaches
+        ),
+    )
     def assess_breach(
         self,
         breach_id: str,
@@ -555,7 +580,12 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         breach.status = BreachStatus.ASSESSED
         return breach
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            b.is_notifiable and b.ico_notified_at is None
+            for b in s.data_breaches
+        ),
+    )
     def notify_ico(
         self,
         breach_id: str,
@@ -594,7 +624,12 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         breach.status = BreachStatus.ICO_NOTIFIED
         return breach
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            b.severity == BreachSeverity.HIGH and b.subjects_notified_at is None
+            for b in s.data_breaches
+        ),
+    )
     def notify_affected_subjects(
         self,
         breach_id: str,
@@ -624,7 +659,11 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         breach.status = BreachStatus.SUBJECTS_NOTIFIED
         return breach
 
-    @action
+    @action(
+        relevance=lambda s, e: any(
+            b.status != BreachStatus.RESOLVED for b in s.data_breaches
+        ),
+    )
     def resolve_breach(
         self,
         breach_id: str,

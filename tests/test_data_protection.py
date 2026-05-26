@@ -12,6 +12,7 @@ import pytest
 
 from distributed_agent_harness.adapters import InMemoryNamespace
 from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.world import PreconditionViolation
 
 from examples.data_protection.models import (
     BreachSeverity,
@@ -89,7 +90,9 @@ class TestEngagement:
     def test_win_pitch_when_already_contracted_raises(
         self, contracted_env: DataProtectionWorldEnvironment
     ) -> None:
-        with pytest.raises(ValueError, match="PITCH"):
+        # The PITCH-state precondition is now enforced by the @action decorator,
+        # so a contracted env raises PreconditionViolation rather than ValueError.
+        with pytest.raises(PreconditionViolation, match="win_pitch"):
             contracted_env.win_pitch(terms_summary="Terms again")
 
 
@@ -138,7 +141,8 @@ class TestPrivacyPolicy:
     def test_cannot_draft_before_contract(
         self, env: DataProtectionWorldEnvironment
     ) -> None:
-        with pytest.raises(ValueError, match="contracted"):
+        # The CONTRACTED-state precondition is enforced by the @action decorator.
+        with pytest.raises(PreconditionViolation, match="draft_privacy_policy"):
             env.draft_privacy_policy(
                 version="1.0", content="...", data_categories=[],
                 processing_purposes=[], retention_periods={},
