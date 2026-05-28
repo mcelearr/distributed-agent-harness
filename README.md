@@ -357,3 +357,290 @@ The 72-hour clock is enforced by the harness — a warning is raised if `notify_
 | Breach Management | `data_breaches` | `report_breach`, `assess_breach`, `notify_ico`, `notify_affected_subjects`, `resolve_breach` |
 
 See [`examples/data_protection/`](examples/data_protection/) for the full implementation.
+
+---
+
+## Roadmap
+
+Three planned pieces of work. Each item below is intentionally self-contained — file paths, class names, acceptance criteria, and open questions are written out so any contributor (or a fresh Claude Code thread) can pick one up without back-history.
+
+| # | Title | Status | Depends on |
+|---|---|---|---|
+| 1 | Collapse `precondition` + `relevance` into one predicate, renamed `show_when` | Planned | — |
+| 2 | A2A subagent support with pluggable agent registries | Planned | — |
+| 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Planned | (1) should land first so the predicate name in the new event-projection flow is stable |
+
+---
+
+### 1. Collapse predicates into a single `show_when`
+
+**Status:** planned
+
+**Goal:** replace the current two-predicate model (`precondition` for hard gating + `relevance` for soft hinting) with a single `show_when` predicate on `@action`. The action is shown to the LLM (and is callable) iff `show_when(state, event)` is True or `show_when` is not set. There is no more Active / Latent split.
+
+**Why:** `show_when` is literal — it describes exactly what happens. The soft/hard distinction has produced no concrete use case that the single-predicate model can't handle by writing a slightly more lenient `show_when`. Collapsing to one knob removes a layer of cognitive load.
+
+**Files to change:**
+
+- `distributed_agent_harness/world.py`:
+  - Replace `precondition` and `relevance` kwargs on `@action` with a single `show_when` kwarg. Same signature `(state, event) -> bool`. Same default (None = always show).
+  - Rename the exception `PreconditionViolation` → `ActionNotAvailable` (the new name matches the new vocabulary; "precondition" no longer appears in the API).
+  - On the wrapper, the stored attribute becomes `_show_when` (drop `_precondition`, `_relevance`).
+  - The `Predicate` type alias stays; it's still `Callable[[BaseModel, TriggerEvent | None], bool]`.
+
+- `distributed_agent_harness/prompt_builder.py`:
+  - Delete the `_partition_actions` helper. There is no partitioning anymore.
+  - `build_actions_prompt(world, event)` produces a single "Available Actions" section. An action appears iff its `_show_when` is None or returns True. Buggy predicates that raise are treated as False, defensively.
+  - Remove the Latent-tier formatter `_format_action_manifest`.
+
+- `distributed_agent_harness/runtime.py`:
+  - The catch for `PreconditionViolation` becomes `ActionNotAvailable`. Same surfacing behaviour (`OutputEvent` payload with `blocked=True`, TOOL message back to LLM).
+
+- `distributed_agent_harness/__init__.py`:
+  - Replace `PreconditionViolation` export with `ActionNotAvailable`.
+
+- `examples/data_protection/world.py`:
+  - Every `precondition=` → `show_when=`.
+  - Every `relevance=` → `show_when=`. Yes — the soft hints are promoted to hard gates. For this domain that is intentional and correct: there is no legitimate use case where the LLM should call `notify_ico` when no breach is outstanding, etc.
+
+- `tests/test_predicates.py`:
+  - Rename `TestPreconditionHardGate` → `TestShowWhen`. Update the API usage. Drop `TestRelevanceSoftHint` and `TestComposition` (no longer applicable).
+  - Add a test confirming a hidden action is invisible in the prompt and uncallable (raises `ActionNotAvailable` when called directly).
+
+- `tests/test_data_protection.py`:
+  - The two tests matching `PreconditionViolation` should match `ActionNotAvailable`.
+
+**Acceptance criteria:**
+
+- `uv run pytest tests/` is green.
+- `uv run python -m examples.data_protection.run` runs end-to-end.
+- The system prompt has one "Available Actions" section, no Active/Latent partitioning.
+- `grep -r "precondition\|relevance\|PreconditionViolation" distributed_agent_harness examples tests` returns nothing (except in the changelog/git history).
+
+---
+
+### 2. A2A subagent support with pluggable agent registries
+
+**Status:** planned
+
+**Goal:** allow the harness to invoke external agents via the A2A (Agent-to-Agent) protocol. Subagents are opaque external services — they don't know about the harness, they have their own conversation memory, they may live on different servers. All registered subagents speak A2A; no custom HTTP/JSON protocols are accepted in the codebase. Subagents are surfaced to the LLM as a separate category of tool, called via `consult_<name>(message)`.
+
+**Why:** business processes need specialists (legal research, document drafting, classification) we don't want to implement inside the harness. A2A is the emerging open standard for agent-to-agent communication (Microsoft Agent Framework, Google ADK, etc. all adopt it). Locking to A2A keeps the abstraction tight.
+
+**A2A primitives we use:**
+
+- `AgentCard` — JSON descriptor: `name`, `description`, `url`, `skills`, `capabilities`, `authentication`. The unit of discovery and registration.
+- `Task` — one unit of work; lifecycle `submitted → working → input-required → completed/failed`.
+- `Message` + `Parts` — payload shape (text, structured data, files).
+- `contextId` — session identifier; A2A's native conversation-continuity mechanism. Maps directly to our `session_id`.
+
+**New module `distributed_agent_harness/subagents/`:**
+
+- `subagents/base.py`:
+  - `class SubagentClient(ABC)` with `name: str`, `description: str`, optional `show_when: Predicate | None` (consistent with item 1), and one method:
+    ```python
+    async def consult(
+        self,
+        message: str,
+        session_id: str | None,
+        context: dict[str, Any] | None = None,
+    ) -> SubagentResponse: ...
+    ```
+  - `@dataclass SubagentResponse`: `content: str`, `session_id: str | None`, `metadata: dict`.
+  - `class SubagentRegistry`: held on `AgentRuntime.subagents`. Methods: `register(client)`, `unregister(name)`, `list() -> list[SubagentClient]`, `get(name) -> SubagentClient`.
+
+- `subagents/a2a.py`:
+  - `class A2ASubagent(SubagentClient)` — speaks A2A over HTTP.
+  - Constructor: `A2ASubagent(card: AgentCard, auth: Callable[[AgentCard], dict] | None = None, show_when: Predicate | None = None)`.
+  - `consult()` implementation:
+    1. Build an A2A task with the message and `contextId=session_id`.
+    2. POST to `card.url` per the A2A spec.
+    3. Stream task status via SSE; collect updates; resolve when state is `completed` or `failed`.
+    4. Extract the final assistant message from the task's message history.
+    5. Return `SubagentResponse(content=..., session_id=task.contextId, metadata={...})`.
+  - Session persistence: store `session_id` per (project_id, subagent_name) at `<project>/subagents/<name>.session.json` via the project namespace adapter. Read on entry to `consult()`, write the response's `session_id` on success.
+
+- `subagents/registry.py`:
+  - `class AgentRegistry(ABC)`:
+    ```python
+    async def search(
+        self,
+        query: str | None = None,
+        capabilities: list[str] | None = None,
+        tags: list[str] | None = None,
+        provider: str | None = None,
+        max_cost_per_call: float | None = None,
+        limit: int = 100,
+    ) -> list[AgentCard]: ...
+
+    async def get(self, agent_id: str) -> AgentCard: ...
+    ```
+  - `HttpAgentRegistry(AgentRegistry)` — talks to an A2A-compatible registry over HTTP.
+  - `StaticAgentRegistry(AgentRegistry)` — list of `AgentCard`s held in code (for tests and small deployments).
+  - Helper `async def load_subagents_from_registry(runtime, registry, **filters) -> list[A2ASubagent]` that searches, wraps each card, registers each on the runtime.
+
+**Runtime integration:**
+
+- `PromptBuilder` adds a new section after the action list:
+  ```markdown
+  ## Available Subagents (external specialists)
+
+  ### `consult_legal_research(message: str) -> str`
+  [card.description]
+  Skills: [card.skills joined]
+  Provider: [card.provider] · contextId persisted across calls.
+  ```
+  Only registered subagents whose `show_when` matches are shown (consistent with item 1).
+
+- `AgentRuntime._execute_call`: when the LLM tool-calls `consult_<name>`, dispatch to the subagent registry rather than to `getattr(world, name)`. Otherwise the wrapping (audit log, hook firing, OutputEvent emission) is the same.
+
+- Audit log line: `consult_legal_research(message='...') → '...' [session abc, 1.2s]`. Subagent calls show up in `event_log.md` alongside `@actions`.
+
+- Hooks: add two new event kinds to `HookRegistry`: `pre_subagent_call(name=None)` and `post_subagent_call(name=None)`. Existing `pre_action` / `post_action` do NOT fire for subagents — different semantic category, different policies (e.g. cost ceilings).
+
+**Dependencies:**
+
+- An async A2A client library. If a maintained Python A2A client exists at implementation time, use it. Otherwise implement a minimal client over `httpx` + SSE following the A2A spec.
+
+**Acceptance criteria:**
+
+- Can register a subagent directly: `runtime.subagents.register(A2ASubagent(card))`.
+- Can bulk-load via a registry: `await load_subagents_from_registry(runtime, registry, capabilities=["legal-research"])`.
+- LLM can call `consult_<name>(message)`; response is returned as a TOOL message.
+- Session persistence works across runs: second call to the same subagent sees the prior `contextId`.
+- Audit log records every subagent call with timing and metadata.
+- `pre_subagent_call` and `post_subagent_call` hooks fire correctly; `pre_action` and `post_action` do NOT fire for subagents.
+- The codebase contains no non-A2A subagent client (no `HttpJsonSubagent`, no `OpenAIAssistantSubagent`, etc.).
+
+**Open questions to resolve during implementation:**
+
+- Auth: should `AgentCard.authentication` carry per-card credentials (simple but credentials in registry), or should the registry resolve auth on the caller's behalf and return pre-authenticated `Bearer` tokens?
+- Cost ceiling: built-in per-run budget enforced via a default `pre_subagent_call` hook, or leave it to operators?
+- A2A task streaming: surface `working → working → completed` updates to the OutputChannel as `OutputEventKind.THINKING` events for UX, or hide them?
+- A `revise` decision (see item 3): a subagent response that says "I need more info" maps to A2A's `input-required` state. For v1 treat as an error; multi-turn task continuation is a future enhancement.
+
+---
+
+### 3. Drop `InProcessLock`; event sourcing + agent-as-rebaser
+
+**Status:** planned (large refactor)
+
+**Goal:** remove pessimistic locking from the harness entirely. Replace it with an event-sourced architecture where:
+
+- Events (one per `@action` invocation) are the source of truth, stored in a totally-ordered append-only log per project.
+- `state.json` becomes a derived projection — a cache, not the truth.
+- Concurrent writes are optimistic: each append carries `expected_offset`. Conflicts (someone else appended first) are surfaced to the LLM as a structured "rebase" decision: continue, revise, restart, or abandon.
+
+**Why:** locks don't compose across data centres, don't allow multi-actor parallelism on disjoint state, and leave the LLM unable to participate in conflict resolution. The agent-as-rebaser pattern is uniquely well-suited to LLMs — they are good at reading a list of intervening events and deciding whether their plan is still valid.
+
+**Removals:**
+
+- `distributed_agent_harness/concurrency.py` (ABC).
+- `distributed_agent_harness/concurrency_handlers/` (the whole package).
+- The `concurrency` constructor argument on `BaseWorldEnvironment` and `AgentRuntime`.
+- The `acquire_lock` / `release_lock` pair around the `@action` wrapper body.
+- The `ConcurrencyHandler` export from `__init__.py`.
+
+**Additions:**
+
+- `distributed_agent_harness/eventlog.py`:
+  - `@dataclass Event`: `id: str`, `timestamp: datetime`, `project_id: str`, `action_name: str`, `args: list`, `kwargs: dict`, `actor: str` (`"agent" | "human" | "subagent:<name>"`), `result_summary: str | None`.
+  - `class EventLog(ABC)`:
+    ```python
+    async def current_offset(self, project_id: str) -> int: ...
+    async def append(self, project_id: str, event: Event, expected_offset: int) -> AppendResult: ...
+    async def read_events(self, project_id: str, from_offset: int = 0) -> list[Event]: ...
+    ```
+  - `AppendResult` is either `Appended(new_offset: int)` or `Conflict(new_offset: int, intervening_events: list[Event])`.
+
+- Built-in `EventLog` implementations:
+  - `InMemoryEventLog` — used for tests and local dev. Implements the same optimistic-append semantics as Kafka (rejects appends whose `expected_offset` is stale).
+  - `KafkaEventLog` — production. One Kafka topic; partition key = `project_id`. Transactional producer for idempotency; consumer for replay. Library choice (aiokafka vs confluent-kafka) is an open question.
+
+- `distributed_agent_harness/conflict.py`:
+  - `@dataclass ConflictContext`: `project_id`, `last_seen_offset`, `current_offset`, `intervening_events: list[Event]`, `planned_action: ToolCall`, `conversation_so_far: list[Message]`.
+  - `class ConflictResolver(ABC)` with one method:
+    ```python
+    async def resolve(self, ctx: ConflictContext, llm: LLMProvider) -> Decision: ...
+    ```
+  - `Decision = Continue() | Revise(new_message: Message) | Restart() | Abandon(reason: str)`.
+  - `class AgentDrivenConflictResolver(ConflictResolver)` — default. Calls the LLM with a structured prompt (see below) and parses one of four canonical responses.
+  - `class AlwaysRestartResolver(ConflictResolver)` — simple fallback for low-trust environments or testing.
+
+**`BaseWorldEnvironment` changes:**
+
+- `@action` wrapper, new flow:
+  1. Read `current_offset` from `EventLog`.
+  2. Read events from `self._last_seen_offset` to current. Apply them to `self.state` to catch up.
+  3. Run the wrapped method (mutates `self.state`).
+  4. Construct an `Event` describing the call.
+  5. `result = await eventlog.append(project_id, event, expected_offset=current_offset)`.
+  6. If `Appended`, update `self._last_seen_offset` and return the method's return value.
+  7. If `Conflict`, raise `ConcurrentUpdate(intervening_events=..., new_offset=...)` for the runtime to handle.
+
+- State projection:
+  - `_hydrate` is replaced by `_project_state_from_events`. Replays all events from offset 0 to current.
+  - Optimisation: periodic snapshots of `state.json` keyed by offset. Hydrate = load snapshot at offset K + replay events from K to current.
+
+**`AgentRuntime` changes:**
+
+- Constructor takes `eventlog: EventLog` and `conflict_resolver: ConflictResolver | None = None` (defaults to `AgentDrivenConflictResolver`) instead of `concurrency`.
+- In `_execute_call`, catch `ConcurrentUpdate` and route through the resolver:
+  1. Emit `OutputEvent(kind=OutputEventKind.CONFLICT, payload={...})`.
+  2. Call `resolver.resolve(ctx, llm)`.
+  3. Act on the decision:
+     - `Continue` — refresh `world._last_seen_offset`, re-issue the same tool call.
+     - `Revise(message)` — drop any remaining queued tool calls in this turn; treat the LLM's revision as the new assistant message; continue the loop.
+     - `Restart` — reset `conversation` to `[]`, re-enter the loop from the original `user_message` against the latest state.
+     - `Abandon(reason)` — emit FINAL with the reason; exit the loop.
+
+**Conflict-resolution prompt (used by `AgentDrivenConflictResolver`):**
+
+```
+## Concurrent State Change Detected
+
+While you were planning, another actor updated the project state.
+Your last seen offset: N.
+Current offset: M.
+
+Intervening events:
+- offset N+1, by <actor> at <timestamp> — `<action>(args)`
+- ...
+
+Your originally planned next action:
+  `<action>(<args>)`
+
+Decide one of:
+- `continue` — your plan is still valid; retry the action against the new state.
+- `revise: <new plan in plain text>` — your plan needs updating.
+- `restart` — too much has changed; start the agent run over.
+- `abandon: <reason>` — stop and report back to the user.
+```
+
+**Idempotency requirements:**
+
+- `@actions` must produce the same effect on replay. Audit all wall-clock usages (`datetime.now()`) and replace with the event's `timestamp` field (passed in via a context object) when running in replay mode.
+- Add a test that asserts replay determinism: replaying a project's events from offset 0 produces a `state.json` identical to the live state at the latest offset.
+- Generated IDs (`new_id()` in `models.py`) become a problem on replay — IDs must be deterministic. Two options: (a) derive from event id, (b) capture as part of the event payload, replay reads it back.
+
+**Migration strategy:**
+
+- The current `audit.jsonl` is structurally close to the new `Event`. The new `Event` shape mirrors it.
+- `summary.md` and `event_log.md` continue to be generated as derived views of the event log on every flush.
+- The data protection example continues to work — only the harness internals change.
+
+**Acceptance criteria:**
+
+- `concurrency.py` and `concurrency_handlers/` are gone from the codebase.
+- All existing tests pass against `InMemoryEventLog`.
+- `uv run python -m examples.data_protection.run` runs end-to-end.
+- A scripted conflict-resolution test: two concurrent actions on the same project trigger the resolver, the test asserts the LLM was called with the conflict prompt and that each of the four decision branches works.
+- Replay-determinism test: project state at latest offset is bit-identical to a state derived by replaying events from offset 0.
+
+**Open questions to resolve during implementation:**
+
+- Snapshot cadence and storage layout: every N events? On every flush? Where in the namespace?
+- For `revise`, does the LLM's new plan execute immediately, or does the runtime first re-render the system prompt with the latest state and let the LLM re-decide?
+- For `restart`, do we start fresh with the original `user_message`, or do we prepend a synthetic note ("you were interrupted by these events, please plan again")?
+- Kafka client library: `aiokafka` (pure async) or `confluent-kafka` (more mature, sync wrapped in `to_thread`)?
+- Can a conflict resolution itself conflict? (Second-order conflicts.) For v1: if the chosen `Continue` action also conflicts, escalate to `Restart` automatically.
