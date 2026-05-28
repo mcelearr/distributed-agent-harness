@@ -4,19 +4,14 @@ PromptBuilder — lifts WorldEnvironment context into the LLM's system prompt.
 The system prompt is composed in a fixed order:
 
     1. Project Summary    — the always-on "card view" from ``render_summary()``
-    2. Available Actions  — partitioned into Active and Latent tiers based on
-                             each action's optional ``precondition`` / ``relevance``
-                             predicates evaluated against current state and trigger
+    2. Available Actions  — every ``@action`` whose ``show_when`` is None or
+                             returns True against the current state + trigger
     3. Recent Activity    — tail of the event log, to help the agent avoid loops
     4. Current State      — exact JSON state, for precise tool-call arguments
 
-Action partitioning (per ``@action`` predicates):
-
-- **Hidden**  — ``precondition`` is set and returns False. Dropped entirely.
-- **Active**  — ``precondition`` (if set) is True AND ``relevance`` (if set or
-                 absent) is True. Full signature + docstring + optional source.
-- **Latent**  — ``precondition`` (if set) is True AND ``relevance`` is set but
-                 returns False. Manifest line only (name + first-line docstring).
+Actions whose ``show_when`` returns False (or raises) are hidden from the
+prompt entirely AND uncallable at runtime — direct invocation raises
+``ActionNotAvailable``.
 """
 from __future__ import annotations
 
@@ -37,8 +32,7 @@ DEFAULT_RECENT_ACTIVITY_COUNT = 12
 
 
 class PromptBuilder:
-    """
-    Builds the agent's system prompt from a WorldEnvironment class.
+    """Builds the agent's system prompt from a WorldEnvironment class.
 
     For each ``@action`` method it surfaces:
 
@@ -53,11 +47,11 @@ class PromptBuilder:
     - The last N lines of ``event_log.md`` (configurable)
     - The exact JSON state
 
-    Action partitioning by predicates: pass a ``world`` (and optionally the
-    triggering ``event``) to ``build_actions_prompt`` / ``build_full_prompt``
-    so each action's ``precondition`` and ``relevance`` can be evaluated.
-    Without a world, predicates are not evaluated and every action is shown
-    in full as Active (backward-compat mode for tests / introspection).
+    Visibility: pass a ``world`` (and optionally the triggering ``event``)
+    to ``build_actions_prompt`` / ``build_full_prompt`` so each action's
+    ``show_when`` can be evaluated. Without a world, ``show_when`` is not
+    evaluated and every action is shown (backward-compat mode for tests and
+    introspection).
     """
 
     def __init__(
@@ -78,7 +72,6 @@ class PromptBuilder:
         """Return ``summary.md`` from the namespace, or fall back to a live render."""
         raw = world._namespace.read_doc(world._summary_path())
         if not raw:
-            # No persisted summary yet (e.g. before the first @action) — render live.
             try:
                 raw = world.render_summary()
             except Exception:  # noqa: BLE001
@@ -90,50 +83,33 @@ class PromptBuilder:
         world: "BaseWorldEnvironment | None" = None,
         event: "TriggerEvent | None" = None,
     ) -> str:
-        """
-        Return a Markdown-formatted description of all ``@action`` methods.
+        """Return a Markdown-formatted description of all visible ``@action`` methods.
 
-        When ``world`` is provided, actions are partitioned by their predicates
-        into Active (full detail) and Latent (manifest line) sections; actions
-        whose ``precondition`` returns False are hidden.
+        When ``world`` is provided, each action's ``show_when`` predicate is
+        evaluated against the current state + trigger; actions whose
+        predicate returns False (or raises) are hidden.
 
         When ``world`` is None, predicates are not evaluated and every action
-        is shown in full (used by tests and introspection callers).
+        is shown (used by tests and introspection callers).
         """
         all_actions = self._world_class.get_actions()
         if not all_actions:
             return "## Available Actions\n\n_(none defined)_"
 
-        if world is None:
-            # Backward-compat: no world means we can't evaluate predicates.
-            sections = ["## Available Actions\n"]
-            for name, method in sorted(all_actions.items()):
-                sections.append(self._format_action_full(name, method))
-            return "\n\n".join(sections)
+        if world is not None:
+            all_actions = {
+                name: method
+                for name, method in all_actions.items()
+                if _evaluate_predicate(
+                    getattr(method, "_show_when", None), world.state, event,
+                )
+            }
+            if not all_actions:
+                return "## Available Actions\n\n_(none currently available)_"
 
-        active, latent = _partition_actions(all_actions, world.state, event)
-
-        if not active and not latent:
-            return "## Available Actions\n\n_(none currently available)_"
-
-        sections = ["## Available Actions"]
-
-        if active:
-            sections.append(
-                "\n### Active — relevant for the current state\n"
-            )
-            for name, method in active:
-                sections.append(self._format_action_full(name, method))
-
-        if latent:
-            sections.append(
-                "\n### Latent — defined but not currently in scope\n\n"
-                "_These actions exist but are not relevant right now. "
-                "Only call them if you have a specific reason._\n"
-            )
-            for name, method in latent:
-                sections.append(self._format_action_manifest(name, method))
-
+        sections = ["## Available Actions\n"]
+        for name, method in sorted(all_actions.items()):
+            sections.append(self._format_action_full(name, method))
         return "\n\n".join(sections)
 
     def build_recent_activity_prompt(self, world: "BaseWorldEnvironment") -> str:
@@ -186,16 +162,6 @@ class PromptBuilder:
 
         return "\n".join(lines)
 
-    @staticmethod
-    def _format_action_manifest(name: str, method: object) -> str:
-        """Compact manifest line: name(params) — first line of docstring."""
-        sig = inspect.signature(method)  # type: ignore[arg-type]
-        param_names = [k for k in sig.parameters if k != "self"]
-        doc = inspect.getdoc(method)  # type: ignore[arg-type]
-        first_line = doc.split("\n", 1)[0] if doc else ""
-        suffix = f" — {first_line}" if first_line else ""
-        return f"- `{name}({', '.join(param_names)})`{suffix}"
-
 
 # --------------------------------------------------------------------------- #
 # Module-level helpers                                                         #
@@ -218,52 +184,19 @@ def _format_signature(name: str, method: object) -> str:
     return f"{name}({param_str}){ret_str}"
 
 
-def _evaluate_predicate(
-    predicate: Any,
-    state: Any,
-    event: Any,
-) -> bool:
-    """
-    Evaluate a predicate, treating exceptions as False (defensive — a buggy
-    predicate should never crash the prompt builder).
+def _evaluate_predicate(predicate: Any, state: Any, event: Any) -> bool:
+    """Evaluate ``show_when``, treating None as True and exceptions as False.
+
+    A predicate that raises is treated as False so that a buggy predicate
+    hides its action rather than crashing prompt construction.
     """
     if predicate is None:
         return True
     try:
         return bool(predicate(state, event))
     except Exception:  # noqa: BLE001
-        log.exception("Action predicate raised; treating as False")
+        log.exception("Action show_when raised; treating as False")
         return False
-
-
-def _partition_actions(
-    all_actions: dict[str, Any],
-    state: Any,
-    event: Any,
-) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]]:
-    """
-    Split actions into ``(active, latent)`` based on their predicates.
-
-    Hidden actions (precondition is set and returns False) are dropped.
-    """
-    active: list[tuple[str, Any]] = []
-    latent: list[tuple[str, Any]] = []
-
-    for name, method in sorted(all_actions.items()):
-        precondition = getattr(method, "_precondition", None)
-        relevance = getattr(method, "_relevance", None)
-
-        # Hidden: precondition is set and false
-        if precondition is not None and not _evaluate_predicate(precondition, state, event):
-            continue
-
-        # Latent: relevance is set and false
-        if relevance is not None and not _evaluate_predicate(relevance, state, event):
-            latent.append((name, method))
-        else:
-            active.append((name, method))
-
-    return active, latent
 
 
 def _tail_bullets(markdown: str, n: int) -> list[str]:

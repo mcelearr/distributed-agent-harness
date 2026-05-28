@@ -49,14 +49,14 @@ from .transport import (
     TriggerKind,
     TriggerSource,
 )
-from .world import BaseWorldEnvironment, Predicate, PreconditionViolation, action
+from .world import ActionNotAvailable, BaseWorldEnvironment, Predicate, action
 
 __all__ = [
     # Core
     "BaseWorldEnvironment",
     "action",
     "Predicate",
-    "PreconditionViolation",
+    "ActionNotAvailable",
     "NamespaceAdapter",
     "PromptBuilder",
     # Event sourcing

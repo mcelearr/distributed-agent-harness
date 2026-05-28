@@ -1,14 +1,17 @@
 """
-Tests for @action predicates — precondition (hard) and relevance (soft).
+Tests for the single ``show_when`` predicate on ``@action``.
 
 Covers:
-- Decorator forms: bare @action, @action(), @action(precondition=...), @action(relevance=...)
-- precondition False → action is hidden in prompt AND blocks at runtime with PreconditionViolation
-- relevance False → action is demoted to Latent tier; runtime still allows it
-- Both compose: hard gate takes priority over soft hint
-- Predicate that raises is treated as False (defensive)
-- _pending_trigger is threaded through the runtime to predicate evaluation
-- Direct calls outside a runtime see event=None
+- Decorator forms: bare ``@action``, ``@action()``, ``@action(show_when=...)``
+- ``show_when`` False → action hidden from the prompt AND blocked at runtime
+  with ``ActionNotAvailable``
+- Predicate that raises is treated as False (defensive, both in prompt
+  and at runtime)
+- ``_pending_trigger`` is threaded through the runtime to predicate
+  evaluation
+- Direct calls outside a runtime see ``event=None``
+- AgentRuntime catches ``ActionNotAvailable`` and surfaces it as a blocked
+  TOOL message to the LLM
 """
 from __future__ import annotations
 
@@ -37,8 +40,8 @@ from distributed_agent_harness.transport import (
     TriggerKind,
 )
 from distributed_agent_harness.world import (
+    ActionNotAvailable,
     BaseWorldEnvironment,
-    PreconditionViolation,
     action,
 )
 
@@ -56,7 +59,7 @@ class PhaseState(BaseModel):
 class PhaseWorld(BaseWorldEnvironment):
     State = PhaseState
 
-    # Bare @action — no predicates, always active.
+    # Bare @action — no predicate, always visible.
     @action
     def add_open_item(self, text: str) -> str:
         """Add an item (always available)."""
@@ -70,44 +73,35 @@ class PhaseWorld(BaseWorldEnvironment):
         self.state.flag = True
         return self.state.flag
 
-    # Hard gate: only callable when phase is "open".
-    @action(precondition=lambda s, e: s.phase == "open")
+    # Visible iff phase=="open".
+    @action(show_when=lambda s, e: s.phase == "open")
     def close_deal(self) -> str:
-        """Close the deal — requires phase=open."""
+        """Close the deal — visible only when phase=open."""
         self.state.phase = "closed"
         return "closed"
 
-    # Soft hint: visible in Latent tier when not relevant.
-    @action(relevance=lambda s, e: s.phase == "closed")
+    # Visible iff phase=="closed".
+    @action(show_when=lambda s, e: s.phase == "closed")
     def reopen_deal(self) -> str:
-        """Reopen a closed deal — relevant only when phase=closed."""
+        """Reopen a closed deal — visible only when phase=closed."""
         self.state.phase = "open"
         return "open"
 
-    # Both: hard gate + soft hint.
-    @action(
-        precondition=lambda s, e: s.phase == "open",
-        relevance=lambda s, e: bool(s.items),
-    )
-    def finalise(self) -> int:
-        """Finalise — requires open phase, relevant when there are items."""
-        return len(self.state.items)
-
     # Predicate that ignores event and only looks at state.
-    @action(precondition=lambda s, e: s.phase == "open")
+    @action(show_when=lambda s, e: s.phase == "open")
     def state_only_predicate(self) -> str:
         """Predicate uses state only."""
         return "ok"
 
     # Predicate that looks at the event.
-    @action(precondition=lambda s, e: e is not None and e.kind == TriggerKind.WEBHOOK)
+    @action(show_when=lambda s, e: e is not None and e.kind == TriggerKind.WEBHOOK)
     def webhook_only(self) -> str:
         """Predicate that requires a webhook trigger."""
         return "webhook"
 
     # Predicate that raises — should be treated as False, defensively.
-    @action(precondition=lambda s, e: (_ for _ in ()).throw(RuntimeError("boom")))
-    def buggy_precondition(self) -> str:
+    @action(show_when=lambda s, e: (_ for _ in ()).throw(RuntimeError("boom")))
+    def buggy_show_when(self) -> str:
         """Predicate that raises."""
         return "should not reach"
 
@@ -180,39 +174,34 @@ class TestDecoratorForms:
 
     def test_decorated_methods_are_actions(self) -> None:
         actions = PhaseWorld.get_actions()
-        # All eight decorated methods should be picked up
         expected = {
             "add_open_item", "set_flag", "close_deal", "reopen_deal",
-            "finalise", "state_only_predicate", "webhook_only",
-            "buggy_precondition",
+            "state_only_predicate", "webhook_only", "buggy_show_when",
         }
         assert set(actions.keys()) == expected
 
-    def test_predicates_stored_on_wrapper(self) -> None:
+    def test_show_when_stored_on_wrapper(self) -> None:
         close_deal = PhaseWorld.get_actions()["close_deal"]
         add_open_item = PhaseWorld.get_actions()["add_open_item"]
-
-        assert close_deal._precondition is not None
-        assert close_deal._relevance is None
-        assert add_open_item._precondition is None
-        assert add_open_item._relevance is None
+        assert close_deal._show_when is not None
+        assert add_open_item._show_when is None
 
 
 # --------------------------------------------------------------------------- #
-# Hard precondition behaviour                                                  #
+# show_when at runtime                                                         #
 # --------------------------------------------------------------------------- #
 
-class TestPreconditionHardGate:
-    def test_passing_precondition_allows_call(self) -> None:
+class TestShowWhen:
+    def test_passing_show_when_allows_call(self) -> None:
         world = _world()  # phase="open"
         result = world.close_deal()
         assert result == "closed"
         assert world.state.phase == "closed"
 
-    def test_failing_precondition_raises_precondition_violation(self) -> None:
+    def test_failing_show_when_raises_action_not_available(self) -> None:
         world = _world()
         world.close_deal()  # phase is now "closed"
-        with pytest.raises(PreconditionViolation, match="close_deal"):
+        with pytest.raises(ActionNotAvailable, match="close_deal"):
             world.close_deal()
 
     def test_violation_carries_action_name_and_reason(self) -> None:
@@ -220,125 +209,72 @@ class TestPreconditionHardGate:
         world.close_deal()
         try:
             world.close_deal()
-        except PreconditionViolation as exc:
+        except ActionNotAvailable as exc:
             assert exc.action_name == "close_deal"
-            assert "precondition" in exc.reason.lower()
+            assert "show_when" in exc.reason.lower()
 
-    def test_predicate_that_raises_treated_as_violation(self) -> None:
-        """A buggy predicate should not propagate as a generic exception."""
+    def test_predicate_that_raises_treated_as_not_available(self) -> None:
         world = _world()
-        with pytest.raises(PreconditionViolation, match="buggy_precondition"):
-            world.buggy_precondition()
+        with pytest.raises(ActionNotAvailable, match="buggy_show_when"):
+            world.buggy_show_when()
 
     def test_event_is_none_outside_runtime(self) -> None:
         """Direct calls with no runtime should see event=None in predicates."""
         world = _world()
-        # webhook_only requires e.kind == WEBHOOK; with e=None, predicate is False
-        with pytest.raises(PreconditionViolation, match="webhook_only"):
+        # webhook_only requires e.kind == WEBHOOK; with e=None, predicate is False.
+        with pytest.raises(ActionNotAvailable, match="webhook_only"):
             world.webhook_only()
 
 
 # --------------------------------------------------------------------------- #
-# Soft relevance behaviour                                                     #
+# show_when in the prompt                                                      #
 # --------------------------------------------------------------------------- #
 
-class TestRelevanceSoftHint:
-    def test_relevance_does_not_block_at_runtime(self) -> None:
-        """relevance=False should still allow the call to run."""
-        world = _world()
-        # reopen_deal has relevance=phase=="closed", but phase="open" by default.
-        # It should still execute when called directly.
-        result = world.reopen_deal()
-        assert result == "open"
-
-    def test_relevance_false_demotes_to_latent_in_prompt(self) -> None:
-        world = _world()  # phase="open" — reopen_deal is not relevant
+class TestShowWhenInPrompt:
+    def test_visible_action_appears_in_prompt(self) -> None:
+        world = _world()  # phase="open" — close_deal is visible
         builder = PromptBuilder(PhaseWorld)
         prompt = builder.build_actions_prompt(world)
+        assert "### `close_deal" in prompt
 
-        # reopen_deal should be in the Latent section
-        assert "Latent" in prompt
-        # Latent section uses one-line manifest format
-        assert "- `reopen_deal()`" in prompt
-
-    def test_relevance_true_promotes_to_active(self) -> None:
+    def test_hidden_action_is_invisible_in_prompt(self) -> None:
         world = _world()
-        world.close_deal()  # phase="closed"; reopen_deal is now relevant
-
+        world.close_deal()  # phase="closed" — close_deal is now hidden
         builder = PromptBuilder(PhaseWorld)
         prompt = builder.build_actions_prompt(world)
-
-        # reopen_deal should be in Active (full detail with ### header)
+        assert "close_deal" not in prompt
+        # And reopen_deal becomes visible.
         assert "### `reopen_deal" in prompt
 
-
-# --------------------------------------------------------------------------- #
-# Composition: precondition + relevance                                        #
-# --------------------------------------------------------------------------- #
-
-class TestComposition:
-    def test_precondition_false_hides_action_entirely(self) -> None:
-        """When precondition is False, action is Hidden regardless of relevance."""
+    def test_buggy_predicate_hides_action_in_prompt(self) -> None:
         world = _world()
-        world.close_deal()  # phase="closed" — finalise's precondition is False
-
         builder = PromptBuilder(PhaseWorld)
         prompt = builder.build_actions_prompt(world)
+        assert "buggy_show_when" not in prompt
 
-        # finalise should not appear in either Active or Latent section
-        assert "finalise" not in prompt
-
-    def test_precondition_true_and_relevance_true_is_active(self) -> None:
-        world = _world()  # phase="open"
-        world.add_open_item("x")  # items now non-empty → finalise is relevant
-
-        builder = PromptBuilder(PhaseWorld)
-        prompt = builder.build_actions_prompt(world)
-
-        assert "### `finalise" in prompt
-
-    def test_precondition_true_and_relevance_false_is_latent(self) -> None:
-        world = _world()  # phase="open", items empty → finalise not relevant
-        builder = PromptBuilder(PhaseWorld)
-        prompt = builder.build_actions_prompt(world)
-
-        # finalise should be in Latent manifest
-        assert "- `finalise()`" in prompt
-
-
-# --------------------------------------------------------------------------- #
-# PromptBuilder partitioning                                                   #
-# --------------------------------------------------------------------------- #
-
-class TestPromptPartitioning:
-    def test_no_world_argument_shows_everything_active(self) -> None:
-        """Backward compat: build_actions_prompt() with no world treats all as Active."""
+    def test_no_world_argument_shows_everything(self) -> None:
+        """Backward-compat: without a world, all actions appear."""
         builder = PromptBuilder(PhaseWorld)
         prompt = builder.build_actions_prompt()  # no world
-
-        # All actions should appear as full headers
         for name in PhaseWorld.get_actions():
             assert f"### `{name}" in prompt or f"### `{name}(" in prompt
 
-    def test_full_prompt_includes_partitioning(self) -> None:
-        world = _world()  # phase="open"
+    def test_no_active_latent_partitioning(self) -> None:
+        """The prompt has exactly one Actions section — no Active/Latent split."""
+        world = _world()
         builder = PromptBuilder(PhaseWorld)
-        prompt = builder.build_full_prompt(world)
-
-        assert "Active" in prompt
-        # phase="open" → reopen_deal is not relevant → goes to Latent
-        assert "Latent" in prompt
+        prompt = builder.build_actions_prompt(world)
+        assert "Active" not in prompt
+        assert "Latent" not in prompt
 
     def test_event_threaded_into_predicate(self) -> None:
-        """The event argument should reach predicates that consume it."""
+        """The event argument reaches predicates that consume it."""
         world = _world()
         builder = PromptBuilder(PhaseWorld)
 
-        # With no event, webhook_only's precondition is False → hidden
         prompt_no_event = builder.build_actions_prompt(world, event=None)
         assert "webhook_only" not in prompt_no_event
 
-        # With a webhook event, webhook_only's precondition is True → active
         prompt_webhook = builder.build_actions_prompt(world, event=_webhook())
         assert "### `webhook_only" in prompt_webhook
 
@@ -349,9 +285,9 @@ class TestPromptPartitioning:
 
 class TestRuntimeBlocking:
     @pytest.mark.asyncio
-    async def test_precondition_violation_surfaces_as_blocked_tool_message(self) -> None:
+    async def test_unavailable_action_surfaces_as_blocked_tool_message(self) -> None:
         runtime = _runtime(scripted=[
-            # First the agent calls close_deal twice — second time should be blocked
+            # Agent calls close_deal twice — the second should be blocked.
             Message(
                 role=Role.ASSISTANT, content=None,
                 tool_calls=[ToolCall(id="c1", name="close_deal", arguments={})],
@@ -365,10 +301,8 @@ class TestRuntimeBlocking:
 
         await runtime.handle(_chat("close it twice"))
 
-        # The third LLM call should see a blocked TOOL message for the second close_deal
         third_call_messages = runtime.llm.calls[2][0]  # type: ignore[attr-defined]
         tool_msgs = [m for m in third_call_messages if m.role == Role.TOOL]
-        # The second one should mention being blocked
         blocked = [m for m in tool_msgs if "blocked" in (m.content or "").lower()]
         assert blocked, f"expected a blocked TOOL message, got: {tool_msgs}"
 
@@ -396,8 +330,6 @@ class TestRuntimeBlocking:
         event.reply_to = ch  # type: ignore[assignment]
         await runtime.handle(event)
 
-        # webhook_only's precondition needs event.kind == WEBHOOK; with the webhook
-        # trigger, it should succeed.
         results = [e for e in ch.events if e.kind == OutputEventKind.ACTION_RESULT]
         successful = [e for e in results if e.payload.get("result") == "webhook"]
         assert successful, f"expected successful webhook_only call, got: {results}"
@@ -417,8 +349,5 @@ class TestPendingTriggerStashing:
         ])
         await runtime.handle(_chat("add x"))
 
-        # After the run, any new world over the same namespace should see
-        # _pending_trigger=None (it's an instance attr, but freshly constructed
-        # worlds initialise it to None).
         new_world = PhaseWorld("p1", runtime.namespace, runtime.eventlog)
         assert new_world._pending_trigger is None

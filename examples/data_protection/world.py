@@ -194,7 +194,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # ----------------------------------------------------------------------- #
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+        show_when=lambda s, e: s.status == EngagementStatus.PITCH,
     )
     def submit_pitch(
         self,
@@ -222,7 +222,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return client
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+        show_when=lambda s, e: s.status == EngagementStatus.PITCH,
     )
     def win_pitch(
         self,
@@ -237,7 +237,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         Agreement (DPA) is included as standard under UK GDPR Art. 28.
         submit_pitch() must have been called first.
         """
-        # The PITCH-state precondition is enforced by the decorator.
+        # The PITCH-state guard is enforced by show_when on the decorator.
         # We still need to ensure a client was actually recorded.
         if not self.state.client:
             raise ValueError("No client on record — call submit_pitch() first")
@@ -254,7 +254,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return contract
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.PITCH,
+        show_when=lambda s, e: s.status == EngagementStatus.PITCH,
     )
     def lose_pitch(self, reason: str) -> None:
         """
@@ -270,7 +270,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # ----------------------------------------------------------------------- #
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+        show_when=lambda s, e: s.status == EngagementStatus.CONTRACTED,
     )
     def draft_privacy_policy(
         self,
@@ -342,7 +342,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # ----------------------------------------------------------------------- #
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+        show_when=lambda s, e: s.status == EngagementStatus.CONTRACTED,
     )
     def register_data_subject(
         self,
@@ -376,7 +376,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # ----------------------------------------------------------------------- #
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+        show_when=lambda s, e: s.status == EngagementStatus.CONTRACTED,
     )
     def submit_dsr(
         self,
@@ -413,7 +413,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return dsr
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             r.status == DSRStatus.SUBMITTED for r in s.data_subject_requests
         ),
     )
@@ -435,7 +435,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return dsr
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             r.status in (DSRStatus.SUBMITTED, DSRStatus.IN_PROGRESS)
             for r in s.data_subject_requests
         ),
@@ -483,7 +483,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return dsr
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             r.status in (DSRStatus.SUBMITTED, DSRStatus.IN_PROGRESS)
             for r in s.data_subject_requests
         ),
@@ -516,7 +516,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
     # ----------------------------------------------------------------------- #
 
     @action(
-        precondition=lambda s, e: s.status == EngagementStatus.CONTRACTED,
+        show_when=lambda s, e: s.status == EngagementStatus.CONTRACTED,
     )
     def report_breach(
         self,
@@ -548,7 +548,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return breach
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             b.status == BreachStatus.REPORTED for b in s.data_breaches
         ),
     )
@@ -581,7 +581,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return breach
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             b.is_notifiable and b.ico_notified_at is None
             for b in s.data_breaches
         ),
@@ -625,7 +625,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return breach
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             b.severity == BreachSeverity.HIGH and b.subjects_notified_at is None
             for b in s.data_breaches
         ),
@@ -660,7 +660,7 @@ class DataProtectionWorldEnvironment(BaseWorldEnvironment):
         return breach
 
     @action(
-        relevance=lambda s, e: any(
+        show_when=lambda s, e: any(
             b.status != BreachStatus.RESOLVED for b in s.data_breaches
         ),
     )

@@ -12,7 +12,7 @@ import pytest
 
 from distributed_agent_harness.adapters import InMemoryNamespace
 from distributed_agent_harness.eventlog import InMemoryEventLog
-from distributed_agent_harness.world import PreconditionViolation
+from distributed_agent_harness.world import ActionNotAvailable
 
 from examples.data_protection.models import (
     BreachSeverity,
@@ -90,9 +90,9 @@ class TestEngagement:
     def test_win_pitch_when_already_contracted_raises(
         self, contracted_env: DataProtectionWorldEnvironment
     ) -> None:
-        # The PITCH-state precondition is now enforced by the @action decorator,
-        # so a contracted env raises PreconditionViolation rather than ValueError.
-        with pytest.raises(PreconditionViolation, match="win_pitch"):
+        # The PITCH-state guard is enforced by show_when on the @action,
+        # so a contracted env raises ActionNotAvailable rather than ValueError.
+        with pytest.raises(ActionNotAvailable, match="win_pitch"):
             contracted_env.win_pitch(terms_summary="Terms again")
 
 
@@ -141,8 +141,8 @@ class TestPrivacyPolicy:
     def test_cannot_draft_before_contract(
         self, env: DataProtectionWorldEnvironment
     ) -> None:
-        # The CONTRACTED-state precondition is enforced by the @action decorator.
-        with pytest.raises(PreconditionViolation, match="draft_privacy_policy"):
+        # The CONTRACTED-state guard is enforced by show_when on the @action.
+        with pytest.raises(ActionNotAvailable, match="draft_privacy_policy"):
             env.draft_privacy_policy(
                 version="1.0", content="...", data_categories=[],
                 processing_purposes=[], retention_periods={},
@@ -259,6 +259,12 @@ class TestDSR:
     def test_unknown_dsr_raises(
         self, env_with_subject: DataProtectionWorldEnvironment
     ) -> None:
+        # show_when on acknowledge_dsr requires at least one SUBMITTED DSR,
+        # so we first submit one to make the action callable; then the
+        # in-method lookup raises ValueError on an unknown id.
+        env_with_subject.submit_dsr(
+            "bob@jones.example", DSRType.ACCESS, "SAR"
+        )
         with pytest.raises(ValueError, match="DSR"):
             env_with_subject.acknowledge_dsr("nonexistent")
 
@@ -369,8 +375,11 @@ class TestDataBreach:
     def test_cannot_notify_ico_without_assessment(
         self, env_with_breach: DataProtectionWorldEnvironment
     ) -> None:
+        # show_when on notify_ico requires a notifiable, unnotified breach;
+        # an unassessed breach has is_notifiable=None, so the action is
+        # hidden and uncallable until assess_breach() runs.
         breach = env_with_breach.state.data_breaches[0]
-        with pytest.raises(ValueError, match="assessed"):
+        with pytest.raises(ActionNotAvailable, match="notify_ico"):
             env_with_breach.notify_ico(breach.id, "Details")
 
     def test_late_ico_notification_raises_warning(
@@ -390,12 +399,15 @@ class TestDataBreach:
     def test_notify_affected_subjects_requires_high_severity(
         self, env_with_breach: DataProtectionWorldEnvironment
     ) -> None:
+        # show_when on notify_affected_subjects requires a HIGH-severity
+        # breach with no prior subject notification; a MEDIUM breach is
+        # not visible to the agent at all.
         breach = env_with_breach.state.data_breaches[0]
         env_with_breach.assess_breach(
             breach.id, BreachSeverity.MEDIUM, True, "Medium risk"
         )
         env_with_breach.notify_ico(breach.id, "Notified ICO")
-        with pytest.raises(ValueError, match="HIGH"):
+        with pytest.raises(ActionNotAvailable, match="notify_affected_subjects"):
             env_with_breach.notify_affected_subjects(
                 breach.id, "email", "We had a breach"
             )

@@ -165,24 +165,16 @@ The Prompt Builder also injects the **current state** of the World Environment s
 
 ---
 
-#### 4. Action Discovery & Scaling *(precondition + relevance predicates)*
+#### 4. Action Discovery & Scaling *(the `show_when` predicate)*
 
-Every `@action` accepts two optional predicates that control how the action appears to the agent and whether it can run. Both have signature `(state, event) -> bool` where `event` is the triggering `TriggerEvent` (or `None` outside a runtime).
+Every `@action` accepts an optional `show_when` predicate with signature `(state, event) -> bool` (where `event` is the triggering `TriggerEvent`, or `None` outside a runtime). The action is shown to the LLM — and is callable — iff `show_when` is unset or returns True against the current state. When it returns False (or raises), the action is hidden from the prompt entirely and any direct invocation raises `ActionNotAvailable`.
 
-| Predicate | When false → | Use for |
-|---|---|---|
-| `precondition` | **Hidden** from the prompt *and* blocked at runtime with `PreconditionViolation` | Hard contracts: "this action cannot legitimately run in this state" |
-| `relevance` | Demoted to the **Latent** prompt tier (manifest line only) | Soft hints: "this exists but is probably not what you want right now" |
+`show_when` runs against the freshly-hydrated state every iteration, so the action set the LLM sees updates automatically as the world changes.
 
-Both predicates compose. They run against the freshly-hydrated state every iteration, so as the world changes the action partitioning updates automatically.
-
-**Example — the full vocabulary on one action:**
+**Example:**
 ```python
 @action(
-    # Hard contract: cannot run before contract is signed.
-    precondition=lambda state, event: state.status == EngagementStatus.CONTRACTED,
-    # Soft hint: only "active" when there's a notifiable unnotified breach.
-    relevance=lambda state, event: any(
+    show_when=lambda state, event: any(
         b.is_notifiable and b.ico_notified_at is None
         for b in state.data_breaches
     ),
@@ -190,17 +182,9 @@ Both predicates compose. They run against the freshly-hydrated state every itera
 def notify_ico(self, breach_id: str, ...): ...
 ```
 
-**Three prompt tiers, generated automatically:**
+`ActionNotAvailable` is caught by the `AgentRuntime` and surfaced to the LLM as a TOOL message with `blocked=True` — identical in shape to a blocked `pre_action` hook decision. The agent learns "I can't do this now" rather than crashing.
 
-| Tier | Content per action | Triggered by |
-|---|---|---|
-| **Active** | Full signature + docstring + (optional) source | precondition true AND relevance true-or-unset |
-| **Latent** | Manifest line: `name(params) — first line of docstring` | precondition true AND relevance is set but false |
-| **Hidden** | (not shown to the model) | precondition is set and false |
-
-The `PreconditionViolation` raised by a blocked action is caught by the `AgentRuntime` and surfaced to the LLM as a TOOL message with `blocked=True`, identical in shape to a blocked `pre_action` hook decision. The agent learns "I can't do this now" rather than crashing.
-
-For very large action sets, future work will add `search_actions(query)` and `describe_action(name)` meta-actions to allow on-demand discovery of Latent actions. With current world sizes (~15 actions) the two-tier partitioning is sufficient.
+For very large action sets, future work will add `search_actions(query)` and `describe_action(name)` meta-actions for on-demand discovery. With current world sizes (~15 actions) the binary visible/hidden split is sufficient.
 
 #### 5. Lifecycle Hooks *(pluggable Python callables)*
 
@@ -366,15 +350,15 @@ Three planned pieces of work. Each item below is intentionally self-contained �
 
 | # | Title | Status | Depends on |
 |---|---|---|---|
-| 1 | Collapse `precondition` + `relevance` into one predicate, renamed `show_when` | Planned | — |
+| 1 | Collapse `precondition` + `relevance` into one predicate, renamed `show_when` | Done | — |
 | 2 | A2A subagent support with pluggable agent registries | Planned | — |
-| 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Planned | (1) should land first so the predicate name in the new event-projection flow is stable |
+| 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Done | (1) should land first so the predicate name in the new event-projection flow is stable |
 
 ---
 
 ### 1. Collapse predicates into a single `show_when`
 
-**Status:** planned
+**Status:** done
 
 **Goal:** replace the current two-predicate model (`precondition` for hard gating + `relevance` for soft hinting) with a single `show_when` predicate on `@action`. The action is shown to the LLM (and is callable) iff `show_when(state, event)` is True or `show_when` is not set. There is no more Active / Latent split.
 
@@ -523,7 +507,7 @@ Three planned pieces of work. Each item below is intentionally self-contained �
 
 ### 3. Drop `InProcessLock`; event sourcing + agent-as-rebaser
 
-**Status:** planned (large refactor)
+**Status:** done
 
 **Goal:** remove pessimistic locking from the harness entirely. Replace it with an event-sourced architecture where:
 

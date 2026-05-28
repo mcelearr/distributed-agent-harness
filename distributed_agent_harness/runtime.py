@@ -37,7 +37,7 @@ from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
-from .world import BaseWorldEnvironment, PreconditionViolation
+from .world import ActionNotAvailable, BaseWorldEnvironment
 
 log = logging.getLogger(__name__)
 
@@ -405,8 +405,8 @@ class AgentRuntime:
             )
 
         # Stash the trigger on the world so the @action wrapper can pass it
-        # to ``precondition`` / ``relevance`` predicates. Cleared in the
-        # ``finally`` even on error so direct callers never see a stale value.
+        # to the ``show_when`` predicate. Cleared in ``finally`` even on
+        # error so direct callers never see a stale value.
         world._pending_trigger = trigger
 
         # The @action wrapper does its own optimistic CAS; offload to a
@@ -431,8 +431,8 @@ class AgentRuntime:
             # Surfaced to the conflict pipeline by the caller; not a TOOL
             # message and not an error event.
             raise
-        except PreconditionViolation as exc:
-            # Hard-precondition violations get the same shape as a blocked
+        except ActionNotAvailable as exc:
+            # show_when=False is surfaced the same way as a blocked
             # pre_action hook: the LLM sees a clear "this is not allowed
             # right now" message and can adapt rather than thrashing.
             error = f"Action blocked: {exc.reason}"

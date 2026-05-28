@@ -8,7 +8,7 @@ Every ``@action`` method is wrapped in an optimistic-CAS transaction:
 
     1. Read current_offset from the EventLog
     2. Re-hydrate state from the snapshot if it is stale
-    3. Evaluate the action's precondition / relevance predicates
+    3. Evaluate the action's show_when predicate (if any)
     4. Execute the method body against the in-memory state
     5. Append an Event to the log with expected_offset
        - on success: flush the snapshot (state.json + _meta.last_offset),
@@ -39,13 +39,14 @@ Predicate = Callable[[BaseModel, "TriggerEvent | None"], bool]
 
 
 # --------------------------------------------------------------------------- #
-# PreconditionViolation — raised by the @action wrapper when a hard predicate  #
-# returns False. The AgentRuntime catches it and surfaces a blocking TOOL      #
-# message to the LLM (same shape as a pre_action hook BlockDecision).          #
+# ActionNotAvailable — raised by the @action wrapper when its ``show_when``    #
+# predicate returns False. The AgentRuntime catches it and surfaces a          #
+# blocking TOOL message to the LLM (same shape as a pre_action hook            #
+# BlockDecision).                                                              #
 # --------------------------------------------------------------------------- #
 
-class PreconditionViolation(Exception):
-    """Raised by an @action wrapper when its ``precondition`` predicate
+class ActionNotAvailable(Exception):
+    """Raised by an @action wrapper when its ``show_when`` predicate
     returns False (or raises). Surfaced to the LLM as a blocking TOOL message.
     """
     def __init__(self, action_name: str, reason: str) -> None:
@@ -122,8 +123,7 @@ def _embed_meta(state_json: str, last_offset: int) -> str:
 def action(
     method: Any = None,
     *,
-    precondition: Predicate | None = None,
-    relevance: Predicate | None = None,
+    show_when: Predicate | None = None,
     reads: tuple[str, ...] = (),
     writes: tuple[str, ...] = (),
 ) -> Any:
@@ -131,19 +131,19 @@ def action(
 
     The wrapper handles the full event-sourced transaction cycle:
 
-        read current_offset → catch up snapshot → evaluate precondition →
+        read current_offset → catch up snapshot → evaluate show_when →
         execute method → append Event with expected_offset → on success,
         flush snapshot + audit + event_log; on conflict, raise
         ConcurrentUpdate for the runtime to resolve.
 
     Parameters
     ----------
-    precondition: Predicate | None
-        Hard contract. If False, action is hidden from the prompt and
-        raises ``PreconditionViolation`` at call time.
-    relevance: Predicate | None
-        Soft hint. If False, action is shown in the Latent prompt tier but
-        is still callable.
+    show_when: Predicate | None
+        Callable ``(state, event) -> bool``. The action is shown in the
+        system prompt — and is callable — iff this returns True or is None.
+        When False, the action is hidden from the prompt entirely and any
+        attempt to invoke it raises ``ActionNotAvailable`` (surfaced as a
+        blocking TOOL message to the LLM).
     reads, writes: tuple[str, ...]
         Top-level state field names the action depends on / mutates. Used
         by the runtime's structural conflict pre-check to skip the LLM
@@ -166,20 +166,20 @@ def action(
             if current_offset != self._last_seen_offset:
                 self._hydrate()
 
-            # Evaluate precondition against the freshly-hydrated state.
-            if precondition is not None:
+            # Evaluate show_when against the freshly-hydrated state.
+            if show_when is not None:
                 event = getattr(self, "_pending_trigger", None)
                 try:
-                    ok = bool(precondition(self.state, event))
+                    ok = bool(show_when(self.state, event))
                 except Exception as exc:  # noqa: BLE001
-                    raise PreconditionViolation(
+                    raise ActionNotAvailable(
                         target_method.__name__,
-                        f"precondition raised {type(exc).__name__}: {exc}",
+                        f"show_when raised {type(exc).__name__}: {exc}",
                     ) from exc
                 if not ok:
-                    raise PreconditionViolation(
+                    raise ActionNotAvailable(
                         target_method.__name__,
-                        "precondition not satisfied for the current state",
+                        "show_when is False for the current state",
                     )
 
             # Execute against in-memory state.
@@ -223,8 +223,7 @@ def action(
 
         wrapper._is_action = True               # type: ignore[attr-defined]
         wrapper._source = source                # type: ignore[attr-defined]
-        wrapper._precondition = precondition    # type: ignore[attr-defined]
-        wrapper._relevance = relevance          # type: ignore[attr-defined]
+        wrapper._show_when = show_when          # type: ignore[attr-defined]
         wrapper._reads = tuple(reads)           # type: ignore[attr-defined]
         wrapper._writes = tuple(writes)         # type: ignore[attr-defined]
         return wrapper
