@@ -10,7 +10,7 @@ import json
 from datetime import datetime, timezone
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.prompt_builder import PromptBuilder
 
 from .models import BreachSeverity, DSRType
@@ -22,12 +22,12 @@ def main() -> None:
     # Bootstrap the harness with zero-dependency in-memory backends       #
     # ------------------------------------------------------------------ #
     namespace = InMemoryNamespace()
-    concurrency = InProcessLock()
+    eventlog = InMemoryEventLog()
 
     env = DataProtectionWorldEnvironment(
         project_id="acme-gdpr-2025",
         namespace=namespace,
-        concurrency=concurrency,
+        eventlog=eventlog,
     )
 
     # ------------------------------------------------------------------ #

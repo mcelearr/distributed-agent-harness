@@ -18,7 +18,7 @@ import pytest
 from pydantic import BaseModel
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.llm import (
     CompletionChunk,
     LLMProvider,
@@ -132,7 +132,7 @@ def _world() -> PhaseWorld:
     return PhaseWorld(
         project_id="p1",
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
     )
 
 
@@ -140,7 +140,7 @@ def _runtime(scripted: list[Message]) -> AgentRuntime:
     return AgentRuntime(
         world_class=PhaseWorld,
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
         llm=FakeLLM(scripted),
     )
 
@@ -420,5 +420,5 @@ class TestPendingTriggerStashing:
         # After the run, any new world over the same namespace should see
         # _pending_trigger=None (it's an instance attr, but freshly constructed
         # worlds initialise it to None).
-        new_world = PhaseWorld("p1", runtime.namespace, runtime.concurrency)
+        new_world = PhaseWorld("p1", runtime.namespace, runtime.eventlog)
         assert new_world._pending_trigger is None

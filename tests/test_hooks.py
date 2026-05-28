@@ -19,7 +19,7 @@ import pytest
 from pydantic import BaseModel
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.hooks import (
     ActionContext,
     BlockDecision,
@@ -102,7 +102,7 @@ def _make_runtime(scripted: list[Message], hooks: HookRegistry | None = None) ->
     return AgentRuntime(
         world_class=ItemWorld,
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
         llm=FakeLLM(scripted),
         hooks=hooks,
     )

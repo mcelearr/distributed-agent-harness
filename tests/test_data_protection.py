@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.world import PreconditionViolation
 
 from examples.data_protection.models import (
@@ -34,7 +34,7 @@ def env() -> DataProtectionWorldEnvironment:
     return DataProtectionWorldEnvironment(
         project_id="test-dp",
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
     )
 
 

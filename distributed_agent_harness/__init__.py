@@ -1,6 +1,25 @@
 """Distributed Agent Harness — shared, auditable world state for multi-agent systems."""
 
-from .concurrency import ConcurrencyHandler
+from .conflict import (
+    Abandon,
+    AgentDrivenConflictResolver,
+    AlwaysRecoverResolver,
+    ConcurrentUpdate,
+    ConflictContext,
+    ConflictResolver,
+    Continue,
+    Decision,
+    Recover,
+    ScriptedResolver,
+)
+from .eventlog import (
+    Appended,
+    AppendResult,
+    Conflict,
+    Event,
+    EventLog,
+    InMemoryEventLog,
+)
 from .hooks import (
     ActionContext,
     ActionErrorHook,
@@ -39,8 +58,25 @@ __all__ = [
     "Predicate",
     "PreconditionViolation",
     "NamespaceAdapter",
-    "ConcurrencyHandler",
     "PromptBuilder",
+    # Event sourcing
+    "Event",
+    "EventLog",
+    "InMemoryEventLog",
+    "Appended",
+    "Conflict",
+    "AppendResult",
+    # Conflict resolution
+    "ConcurrentUpdate",
+    "ConflictContext",
+    "ConflictResolver",
+    "AgentDrivenConflictResolver",
+    "AlwaysRecoverResolver",
+    "ScriptedResolver",
+    "Decision",
+    "Continue",
+    "Recover",
+    "Abandon",
     # LLM
     "LLMProvider",
     "Message",

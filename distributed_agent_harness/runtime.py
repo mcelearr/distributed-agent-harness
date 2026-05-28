@@ -1,15 +1,15 @@
 """
 AgentRuntime — the LLM loop that ties everything together.
 
-Takes a WorldEnvironment class plus a pluggable LLMProvider and runs a
-ReAct-style loop:
+Takes a WorldEnvironment class plus a pluggable LLMProvider and an EventLog
+and runs a ReAct-style loop:
 
     LLM ──tool calls──► WorldEnvironment @action methods
-        ◄──results───
+        ◄──results / conflict resolution───
     LLM ──final message──► OutputChannel
 
 The runtime is fully async. Tool calls execute via ``asyncio.to_thread`` so
-the sync @action machinery (lock / hydrate / execute / flush / release)
+the sync @action machinery (read offset / catch up / execute / append)
 doesn't block the event loop.
 """
 from __future__ import annotations
@@ -21,7 +21,17 @@ from typing import Any, Type
 
 from pydantic import ValidationError, create_model
 
-from .concurrency import ConcurrencyHandler
+from .conflict import (
+    Abandon,
+    AgentDrivenConflictResolver,
+    ConcurrentUpdate,
+    ConflictContext,
+    ConflictResolver,
+    Continue,
+    Recover,
+    fields_disjoint,
+)
+from .eventlog import EventLog
 from .hooks import ActionContext, BlockDecision, HookRegistry
 from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
@@ -66,7 +76,7 @@ class AgentRuntime:
         runtime = AgentRuntime(
             world_class=DataProtectionWorldEnvironment,
             namespace=InMemoryNamespace(),
-            concurrency=InProcessLock(),
+            eventlog=InMemoryEventLog(),
             llm=MistralProvider(),
         )
 
@@ -74,27 +84,34 @@ class AgentRuntime:
             await runtime.handle(event)
     """
 
+    #: Caps applied per call-loop turn.
+    CONTINUE_STREAK_CAP = 3   # Consecutive Continue conflicts → escalate to Recover
+    RECOVER_CAP = 3           # Recover cycles → Abandon
+
     def __init__(
         self,
         world_class: Type[BaseWorldEnvironment],
         namespace: NamespaceAdapter,
-        concurrency: ConcurrencyHandler,
+        eventlog: EventLog,
         llm: LLMProvider,
         max_iterations: int = 12,
         system_preamble: str = DEFAULT_SYSTEM_PREAMBLE,
         include_source_in_prompt: bool = True,
         hooks: HookRegistry | None = None,
+        conflict_resolver: ConflictResolver | None = None,
     ) -> None:
         self.world_class = world_class
         self.namespace = namespace
-        self.concurrency = concurrency
+        self.eventlog = eventlog
         self.llm = llm
         self.max_iterations = max_iterations
         self.system_preamble = system_preamble
         self.hooks = hooks if hooks is not None else HookRegistry()
+        self.conflict_resolver = conflict_resolver or AgentDrivenConflictResolver()
         self._builder = PromptBuilder(world_class, include_source=include_source_in_prompt)
         # Cache tool schemas — they're derived from class definitions, not state
         self._tool_schemas, self._param_models = _build_tool_schemas(world_class)
+        self._action_writes = world_class.action_writes_by_name()
 
     # ----------------------------------------------------------------------- #
     # Convenience hook registration — delegate to self.hooks                   #
@@ -163,7 +180,7 @@ class AgentRuntime:
         world = self.world_class(
             project_id=event.project_id,
             namespace=self.namespace,
-            concurrency=self.concurrency,
+            eventlog=self.eventlog,
         )
 
         user_message = self._user_message_for(event)
@@ -172,6 +189,7 @@ class AgentRuntime:
         conversation: list[Message] = []
 
         try:
+            recover_count = 0
             for _ in range(self.max_iterations):
                 # Refresh world state from the namespace so the system prompt
                 # reflects mutations from the previous tool calls (or other agents).
@@ -191,10 +209,64 @@ class AgentRuntime:
                         ))
                     break
 
-                # Execute each tool call and append results to the conversation
+                # Execute each tool call. Any call may surface a
+                # ConcurrentUpdate, which the conflict pipeline resolves into
+                # Continue / Recover / Abandon.
+                recover_requested = False
+                abandon_reason: str | None = None
+                tool_messages_in_turn: list[Message] = []
                 for call in assistant.tool_calls:
-                    result_message = await self._execute_call(call, world, reply_to, event)
-                    conversation.append(result_message)
+                    outcome, result_message = await self._execute_with_conflict_handling(
+                        call, world, reply_to, event,
+                    )
+                    if result_message is not None:
+                        conversation.append(result_message)
+                        tool_messages_in_turn.append(result_message)
+                    if isinstance(outcome, Recover):
+                        recover_requested = True
+                        break
+                    if isinstance(outcome, Abandon):
+                        abandon_reason = outcome.reason
+                        break
+
+                if abandon_reason is not None:
+                    final = Message(
+                        role=Role.ASSISTANT,
+                        content=f"[abandoned] {abandon_reason}",
+                    )
+                    if reply_to:
+                        await reply_to.emit(OutputEvent(
+                            kind=OutputEventKind.MESSAGE,
+                            payload={"content": final.content},
+                        ))
+                    break
+
+                if recover_requested:
+                    recover_count += 1
+                    if recover_count >= self.RECOVER_CAP:
+                        abandon_msg = (
+                            f"retry cap exceeded ({recover_count} Recover cycles)"
+                        )
+                        final = Message(
+                            role=Role.ASSISTANT,
+                            content=f"[abandoned] {abandon_msg}",
+                        )
+                        if reply_to:
+                            await reply_to.emit(OutputEvent(
+                                kind=OutputEventKind.MESSAGE,
+                                payload={"content": final.content},
+                            ))
+                        break
+                    # Drop the stale assistant turn (and any tool replies it
+                    # produced) and let the next loop iteration re-plan
+                    # against the fresh system prompt. A synthetic SYSTEM
+                    # note tells the model why.
+                    for _ in range(len(tool_messages_in_turn)):
+                        conversation.pop()
+                    if conversation and conversation[-1] is assistant:
+                        conversation.pop()
+                    conversation.append(_recover_note(world._last_seen_offset))
+                    continue
             else:
                 # Hit max_iterations without a final message
                 if reply_to:
@@ -337,8 +409,9 @@ class AgentRuntime:
         # ``finally`` even on error so direct callers never see a stale value.
         world._pending_trigger = trigger
 
-        # The @action wrapper handles its own locking; we offload to a thread
-        # so we don't block the event loop.
+        # The @action wrapper does its own optimistic CAS; offload to a
+        # thread so we don't block the event loop. ConcurrentUpdate is
+        # propagated up so the conflict pipeline can resolve it.
         try:
             result = await asyncio.to_thread(method, **kwargs)
             await self.hooks.fire_post_action(ctx, result)
@@ -354,6 +427,10 @@ class AgentRuntime:
                 tool_call_id=call.id,
                 name=call.name,
             )
+        except ConcurrentUpdate:
+            # Surfaced to the conflict pipeline by the caller; not a TOOL
+            # message and not an error event.
+            raise
         except PreconditionViolation as exc:
             # Hard-precondition violations get the same shape as a blocked
             # pre_action hook: the LLM sees a clear "this is not allowed
@@ -391,6 +468,92 @@ class AgentRuntime:
             )
         finally:
             world._pending_trigger = None
+
+    async def _execute_with_conflict_handling(
+        self,
+        call: ToolCall,
+        world: BaseWorldEnvironment,
+        reply_to: Any,
+        trigger: TriggerEvent,
+    ) -> tuple[Any, Message | None]:
+        """Drive ``_execute_call`` with optimistic-retry + conflict resolution.
+
+        Returns ``(outcome, message)``:
+        - outcome is a string ``"ok"`` on plain success, an instance of
+          ``Recover`` if the caller's turn should be re-planned, or an
+          instance of ``Abandon`` if the run should stop.
+        - message is the TOOL message to thread back into the conversation,
+          or None when no TOOL message should be inserted (Recover / Abandon).
+        """
+        method = getattr(world, call.name, None)
+        planned_reads = tuple(getattr(method, "_reads", ())) if method else ()
+        planned_writes = tuple(getattr(method, "_writes", ())) if method else ()
+
+        continue_streak = 0
+        while True:
+            try:
+                msg = await self._execute_call(call, world, reply_to, trigger)
+                return "ok", msg
+            except ConcurrentUpdate as conflict:
+                if reply_to:
+                    await reply_to.emit(OutputEvent(
+                        kind=OutputEventKind.ERROR,
+                        payload={
+                            "error": str(conflict),
+                            "kind": "conflict",
+                            "action": call.name,
+                            "intervening": [
+                                e.action_name for e in conflict.intervening_events
+                            ],
+                        },
+                    ))
+
+                # Structural pre-check — auto-Continue when intervening
+                # writes can't have invalidated the planned read/write set.
+                auto_continue = (
+                    bool(planned_reads or planned_writes)
+                    and fields_disjoint(
+                        planned_reads,
+                        planned_writes,
+                        conflict.intervening_events,
+                        self._action_writes,
+                    )
+                )
+
+                if auto_continue or continue_streak >= self.CONTINUE_STREAK_CAP:
+                    decision = (
+                        Continue()
+                        if auto_continue
+                        else Recover()
+                    )
+                else:
+                    ctx = ConflictContext(
+                        project_id=world._project_id,
+                        last_seen_offset=conflict.last_seen_offset,
+                        current_offset=conflict.current_offset,
+                        intervening_events=conflict.intervening_events,
+                        planned_action=call,
+                    )
+                    decision = await self.conflict_resolver.resolve(ctx, self.llm)
+
+                # Once the conflict has been surfaced and a decision made,
+                # the agent has acknowledged the intervening events. Advance
+                # the CAS token past them; the snapshot is assumed
+                # consistent (every successful append flushes ``state.json``
+                # before returning).
+                world._hydrate()
+                world._last_seen_offset = conflict.current_offset
+
+                if isinstance(decision, Continue):
+                    continue_streak += 1
+                    continue
+                if isinstance(decision, Recover):
+                    return Recover(), None
+                if isinstance(decision, Abandon):
+                    return decision, None
+
+                # Unknown decision type — treat as Recover.
+                return Recover(), None
 
 
 # --------------------------------------------------------------------------- #
@@ -456,3 +619,21 @@ def _stringify_result(result: Any) -> str:
     if hasattr(result, "model_dump_json"):
         return result.model_dump_json()
     return str(result)
+
+
+def _recover_note(offset: int) -> Message:
+    """Synthetic system message injected after a Recover decision.
+
+    The next loop iteration will rebuild the full system prompt against the
+    freshly-projected state; this note tells the model *why* it is being
+    asked to re-plan.
+    """
+    return Message(
+        role=Role.SYSTEM,
+        content=(
+            "Concurrent state changes were detected during your last turn. "
+            f"The project state has advanced to offset {offset}. Please re-plan "
+            "from scratch against the latest state shown above; do not assume "
+            "your previous plan is still valid."
+        ),
+    )

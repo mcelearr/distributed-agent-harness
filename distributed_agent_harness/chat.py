@@ -20,7 +20,7 @@ import sys
 from typing import Type
 
 from .adapters import InMemoryNamespace
-from .concurrency_handlers import InProcessLock
+from .eventlog import InMemoryEventLog
 from .interfaces import CliChat
 from .llm_providers import MistralProvider
 from .runtime import AgentRuntime
@@ -56,7 +56,7 @@ async def _main_async(args: argparse.Namespace) -> int:
     runtime = AgentRuntime(
         world_class=world_class,
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
         llm=llm,
         max_iterations=args.max_iterations,
     )

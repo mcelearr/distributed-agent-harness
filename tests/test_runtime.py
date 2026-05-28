@@ -12,7 +12,7 @@ import pytest
 from pydantic import BaseModel
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.llm import (
     CompletionChunk,
     LLMProvider,
@@ -94,7 +94,7 @@ def _runtime(world_class, llm: LLMProvider, **kwargs) -> AgentRuntime:
     return AgentRuntime(
         world_class=world_class,
         namespace=InMemoryNamespace(),
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
         llm=llm,
         **kwargs,
     )
@@ -194,13 +194,14 @@ class TestRuntimeLoop:
         runtime = AgentRuntime(
             world_class=TodoWorld,
             namespace=ns,
-            concurrency=InProcessLock(),
+            eventlog=InMemoryEventLog(),
             llm=llm,
         )
         await runtime.handle(_chat_event("add two items"))
 
         # Re-read the state by constructing a new world over the same namespace
-        world = TodoWorld("test-project", ns, InProcessLock())
+        # Build a second world reading the same persisted snapshot.
+        world = TodoWorld("test-project", ns, runtime.eventlog)
         assert world.state.items == ["a", "b"]
 
     @pytest.mark.asyncio

@@ -14,7 +14,7 @@ import pytest
 from pydantic import BaseModel
 
 from distributed_agent_harness.adapters import InMemoryNamespace
-from distributed_agent_harness.concurrency_handlers import InProcessLock
+from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.prompt_builder import PromptBuilder
 from distributed_agent_harness.world import BaseWorldEnvironment, action
 
@@ -58,7 +58,7 @@ def world(namespace: InMemoryNamespace) -> CounterWorld:
     return CounterWorld(
         project_id="test",
         namespace=namespace,
-        concurrency=InProcessLock(),
+        eventlog=InMemoryEventLog(),
     )
 
 
@@ -109,7 +109,7 @@ class TestPersistence:
         world2 = CounterWorld(
             project_id="test",
             namespace=namespace,
-            concurrency=InProcessLock(),
+            eventlog=InMemoryEventLog(),
         )
         assert "persisted" in world2.state.items
 
@@ -122,20 +122,23 @@ class TestPersistence:
         world = CounterWorld(
             project_id="test",
             namespace=namespace,
-            concurrency=InProcessLock(),
+            eventlog=InMemoryEventLog(),
         )
         assert world.state.counter == 42
 
     def test_action_always_reads_latest_state(
         self, namespace: InMemoryNamespace
     ) -> None:
-        """Each @action re-reads the namespace before executing (never stale)."""
-        world1 = CounterWorld("test", namespace, InProcessLock())
-        world2 = CounterWorld("test", namespace, InProcessLock())
+        """Two worlds sharing the same namespace and eventlog never see
+        stale state — each @action catches up before executing."""
+        eventlog = InMemoryEventLog()
+        world1 = CounterWorld("test", namespace, eventlog)
+        world2 = CounterWorld("test", namespace, eventlog)
 
         world1.increment(10)
-        # world2's in-memory state is stale (still 0), but the @action
-        # wrapper calls _hydrate() first, so it sees counter=10 and adds 5
+        # world2's in-memory state was 0 at construction. The @action wrapper
+        # detects the log has advanced, re-hydrates from snapshot (counter=10),
+        # then adds 5.
         world2.increment(5)
 
         assert world2.state.counter == 15
@@ -299,7 +302,7 @@ class TestSummaryDoc:
                 self.state.x += 1
                 return self.state.x
 
-        world = FancyWorld("p1", namespace, InProcessLock())
+        world = FancyWorld("p1", namespace, InMemoryEventLog())
         world.bump()
         summary = namespace.read_doc("p1/summary.md")
         assert summary == "# Fancy\n\nx = 1\n"
@@ -323,7 +326,7 @@ class TestSummaryDoc:
                 self.state.v = value
                 return value
 
-        world = BuggyWorld("p1", namespace, InProcessLock())
+        world = BuggyWorld("p1", namespace, InMemoryEventLog())
         world.set_v(42)
         # State.json was still written
         assert "42" in namespace.read_doc("p1/state.json")
@@ -401,32 +404,64 @@ class TestRecentActivityInPrompt:
 
 
 # --------------------------------------------------------------------------- #
-# Concurrency                                                                  #
+# Optimistic CAS — replaces the old InProcessLock test                         #
 # --------------------------------------------------------------------------- #
 
-class TestConcurrency:
-    def test_concurrent_increments_are_safe(
+class TestOptimisticCAS:
+    def test_concurrent_threads_surface_concurrent_update(
         self, namespace: InMemoryNamespace
     ) -> None:
-        """10 threads each incrementing 10 times should give counter == 100."""
-        concurrency = InProcessLock()
-        world = CounterWorld("test", namespace, concurrency)
+        """Two threads racing on the same project should produce one
+        successful append and one ConcurrentUpdate (no lost updates, no
+        silent corruption)."""
+        from distributed_agent_harness.conflict import ConcurrentUpdate
 
-        def run() -> None:
-            for _ in range(10):
-                world.increment(1)
+        eventlog = InMemoryEventLog()
+        world_a = CounterWorld("race", namespace, eventlog)
+        world_b = CounterWorld("race", namespace, eventlog)
 
-        threads = [threading.Thread(target=run) for _ in range(10)]
+        results: list[BaseException | int] = []
+        barrier = threading.Barrier(2)
+
+        def run(world: CounterWorld) -> None:
+            barrier.wait()
+            try:
+                results.append(world.increment(1))
+            except ConcurrentUpdate as exc:
+                results.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=(world_a,)),
+            threading.Thread(target=run, args=(world_b,)),
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
 
-        assert world.state.counter == 100
+        succeeded = [r for r in results if isinstance(r, int)]
+        conflicted = [r for r in results if isinstance(r, ConcurrentUpdate)]
+        # Exactly one writer wins; the loser sees ConcurrentUpdate.
+        assert len(succeeded) >= 1
+        assert len(succeeded) + len(conflicted) == 2
+        # Counter on disk reflects only the winners (no double-counting).
+        final = CounterWorld("race", namespace, eventlog)
+        assert final.state.counter == len(succeeded)
+
+    def test_serial_calls_accumulate_offset(
+        self, namespace: InMemoryNamespace
+    ) -> None:
+        """Serial calls flow through CAS happily."""
+        eventlog = InMemoryEventLog()
+        world = CounterWorld("serial", namespace, eventlog)
+        for _ in range(5):
+            world.increment(2)
+        assert world.state.counter == 10
+        assert world._last_seen_offset == 5
 
     def test_missing_state_class_raises(self, namespace: InMemoryNamespace) -> None:
         class BadWorld(BaseWorldEnvironment):
             pass  # No State defined
 
         with pytest.raises(TypeError, match="State"):
-            BadWorld("test", namespace, InProcessLock())
+            BadWorld("test", namespace, InMemoryEventLog())

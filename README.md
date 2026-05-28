@@ -529,9 +529,18 @@ Three planned pieces of work. Each item below is intentionally self-contained �
 
 - Events (one per `@action` invocation) are the source of truth, stored in a totally-ordered append-only log per project.
 - `state.json` becomes a derived projection — a cache, not the truth.
-- Concurrent writes are optimistic: each append carries `expected_offset`. Conflicts (someone else appended first) are surfaced to the LLM as a structured "rebase" decision: continue, revise, restart, or abandon.
+- Concurrent writes are optimistic: each append carries `expected_offset`. Conflicts (someone else appended first) are surfaced to the LLM as a structured decision: **Continue**, **Recover**, or **Abandon**.
 
 **Why:** locks don't compose across data centres, don't allow multi-actor parallelism on disjoint state, and leave the LLM unable to participate in conflict resolution. The agent-as-rebaser pattern is uniquely well-suited to LLMs — they are good at reading a list of intervening events and deciding whether their plan is still valid.
+
+**Decisions captured before implementation:**
+
+- **Kafka client**: `aiokafka` (pure async, no system-lib dependency, slots into the existing async runtime; performance is not the bottleneck at expected agent counts).
+- **Snapshot cadence**: on every flush. Snapshot is the existing `state.json` with an inline `_meta: { "last_offset": N }` field. Hydration = load snapshot, take `last_offset`, replay events at offset > `last_offset`.
+- **Conflict granularity**: per-action (not per-transaction / not per-agent in-memory log). Catching conflicts at action 1 is strictly better than discovering at "merge time" that 8 turns of planning are stale.
+- **Structural pre-check before LLM resolver**: if the intervening events' touched-fields are disjoint from the planned action's touched-fields, auto-`Continue` without an LLM round-trip. The LLM resolver only fires on genuine semantic overlap. Field sets per action are declared via the `@action(reads=..., writes=...)` kwargs; absent declarations are treated as "touches all" (conservative).
+- **Decision set**: `Continue | Recover | Abandon`. The previous `revise` and `restart` are merged into `Recover`: rebuild the system prompt with fresh state + a synthetic system message listing the intervening events, keep the conversation, let the LLM re-plan from scratch in the same turn.
+- **Retry caps**: 3 consecutive `Continue` conflicts on the same plan auto-escalates to `Recover`. 3 `Recover` cycles per user-turn auto-escalates to `Abandon`. Counter resets on a successful action append.
 
 **Removals:**
 
@@ -563,9 +572,10 @@ Three planned pieces of work. Each item below is intentionally self-contained �
     ```python
     async def resolve(self, ctx: ConflictContext, llm: LLMProvider) -> Decision: ...
     ```
-  - `Decision = Continue() | Revise(new_message: Message) | Restart() | Abandon(reason: str)`.
-  - `class AgentDrivenConflictResolver(ConflictResolver)` — default. Calls the LLM with a structured prompt (see below) and parses one of four canonical responses.
-  - `class AlwaysRestartResolver(ConflictResolver)` — simple fallback for low-trust environments or testing.
+  - `Decision = Continue() | Recover() | Abandon(reason: str)`.
+  - `def fields_disjoint(planned_action, intervening_events) -> bool` — structural pre-check used by the runtime *before* invoking the resolver. Compares `(reads ∪ writes)` of planned action against `writes` of intervening events. Returns True iff disjoint.
+  - `class AgentDrivenConflictResolver(ConflictResolver)` — default. Calls the LLM with a structured prompt (see below) and parses one of three canonical responses.
+  - `class AlwaysRecoverResolver(ConflictResolver)` — simple fallback for low-trust environments or testing.
 
 **`BaseWorldEnvironment` changes:**
 
@@ -575,24 +585,33 @@ Three planned pieces of work. Each item below is intentionally self-contained �
   3. Run the wrapped method (mutates `self.state`).
   4. Construct an `Event` describing the call.
   5. `result = await eventlog.append(project_id, event, expected_offset=current_offset)`.
-  6. If `Appended`, update `self._last_seen_offset` and return the method's return value.
-  7. If `Conflict`, raise `ConcurrentUpdate(intervening_events=..., new_offset=...)` for the runtime to handle.
+  6. If `Appended`, update `self._last_seen_offset`, flush snapshot (`state.json` with `_meta.last_offset = new_offset`), return the method's return value.
+  7. If `Conflict`, raise `ConcurrentUpdate(intervening_events=..., new_offset=..., planned_action=...)` for the runtime to handle.
 
 - State projection:
-  - `_hydrate` is replaced by `_project_state_from_events`. Replays all events from offset 0 to current.
-  - Optimisation: periodic snapshots of `state.json` keyed by offset. Hydrate = load snapshot at offset K + replay events from K to current.
+  - `_hydrate` becomes: load snapshot from `state.json`, read `_meta.last_offset = K`, replay events from `K` to current offset on top of the snapshot.
+  - Snapshot is rewritten on every successful flush. No separate snapshot cadence policy needed at v1.
+  - `_meta` is stripped from the user-visible state and reattached on serialisation — domain `State` Pydantic models are unaware of it.
+
+- Optional `@action` kwargs for the structural pre-check:
+  - `reads: tuple[str, ...] = ()` — top-level state field names the action depends on.
+  - `writes: tuple[str, ...] = ()` — top-level state field names the action mutates.
+  - When both are absent the runtime treats the action as touching everything (so conflicts always invoke the LLM resolver — the safe default).
 
 **`AgentRuntime` changes:**
 
 - Constructor takes `eventlog: EventLog` and `conflict_resolver: ConflictResolver | None = None` (defaults to `AgentDrivenConflictResolver`) instead of `concurrency`.
-- In `_execute_call`, catch `ConcurrentUpdate` and route through the resolver:
-  1. Emit `OutputEvent(kind=OutputEventKind.CONFLICT, payload={...})`.
-  2. Call `resolver.resolve(ctx, llm)`.
+- In `_execute_call`, catch `ConcurrentUpdate` and route through the conflict pipeline:
+  1. **Structural pre-check** — call `fields_disjoint(planned_action, intervening_events)`. If True, auto-`Continue` (no LLM round-trip, no `CONFLICT` event surfaced).
+  2. Otherwise emit `OutputEvent(kind=OutputEventKind.CONFLICT, payload={...})` and call `resolver.resolve(ctx, llm)`.
   3. Act on the decision:
-     - `Continue` — refresh `world._last_seen_offset`, re-issue the same tool call.
-     - `Revise(message)` — drop any remaining queued tool calls in this turn; treat the LLM's revision as the new assistant message; continue the loop.
-     - `Restart` — reset `conversation` to `[]`, re-enter the loop from the original `user_message` against the latest state.
+     - `Continue` — refresh `world._last_seen_offset`, re-issue the same tool call. Increment `continue_streak`.
+     - `Recover` — rebuild the system prompt against the freshly-projected state, inject a SYSTEM message listing the intervening events ("while you were planning, the following happened: ..."), keep the existing conversation, let the LLM produce a new assistant turn. Increment `recover_count`, reset `continue_streak`.
      - `Abandon(reason)` — emit FINAL with the reason; exit the loop.
+- Retry-cap state lives on the per-turn `_execute_call` frame (not the runtime instance):
+  - `continue_streak >= 3` auto-escalates the next conflict to `Recover` without consulting the resolver.
+  - `recover_count >= 3` auto-escalates the next conflict to `Abandon("retry cap exceeded")`.
+  - A successful append resets both counters.
 
 **Conflict-resolution prompt (used by `AgentDrivenConflictResolver`):**
 
@@ -612,8 +631,7 @@ Your originally planned next action:
 
 Decide one of:
 - `continue` — your plan is still valid; retry the action against the new state.
-- `revise: <new plan in plain text>` — your plan needs updating.
-- `restart` — too much has changed; start the agent run over.
+- `recover` — your plan is stale; re-plan from scratch against the new state (the conversation is kept; only the assistant's next turn is regenerated).
 - `abandon: <reason>` — stop and report back to the user.
 ```
 
@@ -637,10 +655,8 @@ Decide one of:
 - A scripted conflict-resolution test: two concurrent actions on the same project trigger the resolver, the test asserts the LLM was called with the conflict prompt and that each of the four decision branches works.
 - Replay-determinism test: project state at latest offset is bit-identical to a state derived by replaying events from offset 0.
 
-**Open questions to resolve during implementation:**
+**Open questions remaining for implementation:**
 
-- Snapshot cadence and storage layout: every N events? On every flush? Where in the namespace?
-- For `revise`, does the LLM's new plan execute immediately, or does the runtime first re-render the system prompt with the latest state and let the LLM re-decide?
-- For `restart`, do we start fresh with the original `user_message`, or do we prepend a synthetic note ("you were interrupted by these events, please plan again")?
-- Kafka client library: `aiokafka` (pure async) or `confluent-kafka` (more mature, sync wrapped in `to_thread`)?
-- Can a conflict resolution itself conflict? (Second-order conflicts.) For v1: if the chosen `Continue` action also conflicts, escalate to `Restart` automatically.
+- Deterministic IDs on replay — `new_id()` currently produces fresh UUIDs. v1 fix: each action that creates IDs takes the id from the event payload during replay (event carries `result_payload` with any generated IDs; replay assigns them back rather than calling `new_id()`).
+- Wall-clock determinism — every `datetime.now()` inside an `@action` must be replaced with `self._now()` which reads from the event's `timestamp` during replay and from the system clock during live execution.
+- Whether the structural pre-check's `reads`/`writes` should be inferred from the method body via AST (later) rather than declared by the implementer.
