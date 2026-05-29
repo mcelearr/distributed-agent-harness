@@ -76,6 +76,10 @@ def list_dir(adapter: "NamespaceAdapter", path: str = "") -> list[DirEntry]:
         state.json   (file)
 
     Trailing ``/`` on ``path`` is optional and inserted if missing.
+
+    File sizes are sourced from ``adapter.doc_info`` when implemented so
+    binary documents report their real size; text-only adapters fall
+    through to the length of ``read_doc``.
     """
     prefix = path
     if prefix and not prefix.endswith("/"):
@@ -96,13 +100,25 @@ def list_dir(adapter: "NamespaceAdapter", path: str = "") -> list[DirEntry]:
             dir_name = rel.split("/", 1)[0]
             seen_dirs.add(dir_name)
         else:
-            content = adapter.read_doc(full_path)
-            size = len(content) if content is not None else 0
-            files.append(DirEntry(name=rel, kind="file", size=size))
+            files.append(DirEntry(name=rel, kind="file", size=_size_for(adapter, full_path)))
 
     dirs = [DirEntry(name=d, kind="directory") for d in sorted(seen_dirs)]
     files.sort(key=lambda e: e.name)
     return dirs + files
+
+
+def _size_for(adapter: "NamespaceAdapter", path: str) -> int:
+    """Best-effort byte size lookup for a doc at ``path``.
+
+    Prefers ``doc_info`` so we don't have to load full content (relevant
+    for binary docs and large text). Falls back to ``read_doc`` length on
+    adapters that haven't overridden ``doc_info``.
+    """
+    info = adapter.doc_info(path)
+    if info is not None:
+        return info.size
+    text = adapter.read_doc(path)
+    return len(text.encode("utf-8")) if text is not None else 0
 
 
 def render_ls(entries: list[DirEntry]) -> str:
@@ -136,15 +152,36 @@ def read_doc(
     offset: int | None = None,
     limit: int | None = None,
 ) -> tuple[str | None, dict]:
-    """Read a text doc with optional 1-indexed line offset/limit.
+    """Read a document, auto-detecting text vs binary.
 
-    Returns ``(content, meta)`` where ``meta`` includes ``total_lines`` and
-    a ``truncated`` flag the runtime uses to decide whether to append a
-    continuation hint.
+    Returns ``(content, meta)``:
+
+    - Text doc → ``content`` is the (possibly windowed) text; ``meta``
+      carries ``total_lines``, ``first_line``, ``last_line``, ``truncated``.
+    - Binary doc → ``content`` is ``None``; ``meta`` carries ``binary=True``
+      and DocInfo fields (``size``, ``mime``, ``sha256``). The runtime
+      passes this to ``render_read`` which formats a descriptor for the
+      LLM. Image visibility (sending bytes to vision-capable models as a
+      proper content attachment) is a future enhancement; v1 surfaces a
+      descriptor only so the agent at least knows what's there.
+    - Missing → both ``content`` and ``meta`` are empty.
     """
     raw = adapter.read_doc(path)
     if raw is None:
-        return None, {}
+        # Could be missing, or could be a binary doc. Probe.
+        try:
+            binary = adapter.read_binary(path)
+        except NotImplementedError:
+            binary = None
+        if binary is None:
+            return None, {}
+        info = adapter.doc_info(path)
+        return None, {
+            "binary": True,
+            "size": info.size if info else len(binary),
+            "mime": info.mime if info else None,
+            "sha256": info.sha256 if info else None,
+        }
 
     lines = raw.split("\n")
     total = len(lines)
@@ -169,6 +206,21 @@ def read_doc(
 
 def render_read(content: str | None, path: str, meta: dict) -> str:
     """Human-readable rendering for the LLM-facing TOOL message."""
+    if meta.get("binary"):
+        mime = meta.get("mime") or "application/octet-stream"
+        size = _format_size(int(meta.get("size") or 0))
+        sha = meta.get("sha256") or ""
+        sha_short = f"sha256:{sha[:12]}…" if sha else ""
+        bits = [f"binary doc `{path}`", f"type {mime}", f"size {size}"]
+        if sha_short:
+            bits.append(sha_short)
+        descriptor = " | ".join(bits)
+        return (
+            f"[{descriptor}]\n\n"
+            "_Binary content is not rendered inline. The descriptor above "
+            "is sufficient to reference this artefact, e.g. when replying "
+            "to a user or summarising the project's deliverables._"
+        )
     if content is None:
         return f"_(no such document: `{path}`)_"
     if meta.get("offset_out_of_range"):

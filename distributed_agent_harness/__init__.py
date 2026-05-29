@@ -52,7 +52,7 @@ from .llm import (
     ToolCall,
     ToolSchema,
 )
-from .namespace import NamespaceAdapter
+from .namespace import DocInfo, NamespaceAdapter
 from .prompt_builder import PromptBuilder
 from .runtime import AgentRuntime
 from .subagents import (
@@ -85,6 +85,7 @@ __all__ = [
     "Predicate",
     "ActionNotAvailable",
     "NamespaceAdapter",
+    "DocInfo",
     "PromptBuilder",
     # Event sourcing
     "Event",

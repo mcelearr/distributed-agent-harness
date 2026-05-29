@@ -356,7 +356,7 @@ Each item below is intentionally self-contained — file paths, class names, acc
 | 4 | `search_event_log` — built-in queryable view over the project event log | Done | (3) |
 | 5 | In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`) | Planned | (6, 7) |
 | 6 | Filesystem-style navigation meta-tools (`ls` / `read` / `grep`) | Done | — |
-| 7 | Binary documents in `NamespaceAdapter` (`read_binary` / `write_binary`) | Planned | (6) |
+| 7 | Binary documents in `NamespaceAdapter` (`read_binary` / `write_binary`) | Done | (6) |
 
 ---
 
@@ -787,7 +787,7 @@ Decide one of:
 
 ### 7. Binary documents in `NamespaceAdapter`
 
-**Status:** planned (depends on 6)
+**Status:** done
 
 **Goal:** the namespace is currently text-only. Subagents (and humans) routinely produce binary artefacts — PDFs, images, spreadsheets — that need to live somewhere accessible to the LLM. Extend `NamespaceAdapter` with optional binary methods so artefacts get first-class storage alongside text docs.
 
