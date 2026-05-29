@@ -346,13 +346,15 @@ See [`examples/data_protection/`](examples/data_protection/) for the full implem
 
 ## Roadmap
 
-Three planned pieces of work. Each item below is intentionally self-contained — file paths, class names, acceptance criteria, and open questions are written out so any contributor (or a fresh Claude Code thread) can pick one up without back-history.
+Each item below is intentionally self-contained — file paths, class names, acceptance criteria, and open questions are written out so any contributor (or a fresh Claude Code thread) can pick one up without back-history.
 
 | # | Title | Status | Depends on |
 |---|---|---|---|
 | 1 | Collapse `precondition` + `relevance` into one predicate, renamed `show_when` | Done | — |
-| 2 | A2A subagent support with pluggable agent registries | Planned | — |
+| 2 | A2A subagent support with pluggable agent registries | Done | (4) landed as part of this work |
 | 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Done | (1) should land first so the predicate name in the new event-projection flow is stable |
+| 4 | `search_event_log` — built-in queryable view over the project event log | Done | (3) |
+| 5 | In-process subagent ABC (asyncio / subprocess / messaging variants) | Planned | (2) |
 
 ---
 
@@ -405,44 +407,59 @@ Three planned pieces of work. Each item below is intentionally self-contained �
 
 ### 2. A2A subagent support with pluggable agent registries
 
-**Status:** planned
+**Status:** done
 
-**Goal:** allow the harness to invoke external agents via the A2A (Agent-to-Agent) protocol. Subagents are opaque external services — they don't know about the harness, they have their own conversation memory, they may live on different servers. All registered subagents speak A2A; no custom HTTP/JSON protocols are accepted in the codebase. Subagents are surfaced to the LLM as a separate category of tool, called via `consult_<name>(message)`.
+**Goal:** allow the harness to invoke external agents via the A2A (Agent-to-Agent) protocol. Subagents are opaque external services — they don't know about the harness, they have their own conversation memory, they live on different servers reachable over HTTP+SSE. All registered subagents speak A2A; no custom HTTP/JSON protocols are accepted in the codebase. Subagents are surfaced to the LLM as a separate category of tool, called via `consult_<name>(message, session_id=None)`.
 
-**Why:** business processes need specialists (legal research, document drafting, classification) we don't want to implement inside the harness. A2A is the emerging open standard for agent-to-agent communication (Microsoft Agent Framework, Google ADK, etc. all adopt it). Locking to A2A keeps the abstraction tight.
+**Why:** business processes need specialists (legal research, document drafting, classification) we don't want to implement inside the harness. A2A is the emerging open standard for agent-to-agent communication. Locking to A2A keeps the abstraction tight.
+
+**Decisions captured before implementation:**
+
+- **Transport**: HTTP + SSE only. No polling, no WebSocket, no JSON-RPC alternative. Hard timeout per call **60 s**; the server is expected to emit at least a keep-alive comment / `working` event every 59 s, otherwise the harness cancels the stream and surfaces `SubagentTimeout`. No retry, no reconnect.
+- **Auth**: pluggable per-subagent and per-registry. No inheritance from the parent agent. No OAuth dance. `auth` is a `dict[str, str]` of static headers or a `Callable[[], dict[str, str]]` returning fresh headers each call. Out of scope for v1: cost ceilings, per-call budgets.
+- **Registry pattern**: **load at startup**. The corporate roster is known; we don't need live discovery. `AgentRegistry` ABC stays so an HTTP-backed registry (the BFA pattern) can be swapped in later. No `search_subagents` meta-action in v1.
+- **Registry filters** (simplified from the original draft): just `query: str | None` (free-text over `name` + `description`) and `tags: list[str] | None` (matches `skills[*].tags` on the AgentCard). Dropped: `capabilities=`, `provider=`, `max_cost_per_call=`. Easy to extend later.
+- **Session continuity**: `contextId` round-trips through the TOOL response — no side-store. The `consult_<name>` tool accepts an optional `session_id` argument; the response carries the returned `session_id` so the LLM can pass it back on a follow-up call. Within a run the LLM reads it from its own conversation history; across runs it uses `search_event_log` (item 4) to find prior consults.
+- **Three-state response**: A2A's `completed` / `input-required` / `failed` states all map directly. `input-required` is surfaced as a TOOL message containing the clarification question and the same `session_id`; the LLM decides whether to follow up or report back to the user. No auto-prompting the user.
+- **Streaming UX**: incoming `working` events are forwarded to the `OutputChannel` as `OutputEventKind.THINKING`, so chat UIs can show the subagent thinking. The final `completed` event still produces the TOOL message.
 
 **A2A primitives we use:**
 
-- `AgentCard` — JSON descriptor: `name`, `description`, `url`, `skills`, `capabilities`, `authentication`. The unit of discovery and registration.
-- `Task` — one unit of work; lifecycle `submitted → working → input-required → completed/failed`.
-- `Message` + `Parts` — payload shape (text, structured data, files).
-- `contextId` — session identifier; A2A's native conversation-continuity mechanism. Maps directly to our `session_id`.
+- `AgentCard` — JSON descriptor: `name`, `description`, `url`, `skills` (each with `name`, `description`, `tags`), `provider`. The unit of discovery and registration.
+- `Task` — one unit of work; lifecycle `submitted → working → (completed | input-required | failed)`.
+- `Message` + `Parts` — payload shape (text only in v1).
+- `contextId` — session identifier; A2A's native conversation-continuity mechanism. Maps to our `session_id`.
 
 **New module `distributed_agent_harness/subagents/`:**
 
 - `subagents/base.py`:
-  - `class SubagentClient(ABC)` with `name: str`, `description: str`, optional `show_when: Predicate | None` (consistent with item 1), and one method:
+  - `@dataclass AgentCard`: `name`, `description`, `url`, `skills: list[Skill]`, `provider: str | None`.
+  - `@dataclass Skill`: `name`, `description`, `tags: list[str]`.
+  - `class SubagentClient(ABC)` with attributes `name: str`, `description: str`, optional `show_when: Predicate | None` (consistent with item 1), and one method:
     ```python
     async def consult(
         self,
         message: str,
-        session_id: str | None,
-        context: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        timeout: float = 60.0,
+        on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> SubagentResponse: ...
     ```
-  - `@dataclass SubagentResponse`: `content: str`, `session_id: str | None`, `metadata: dict`.
-  - `class SubagentRegistry`: held on `AgentRuntime.subagents`. Methods: `register(client)`, `unregister(name)`, `list() -> list[SubagentClient]`, `get(name) -> SubagentClient`.
+    The `on_progress` callback receives each streamed `working` text delta, so the runtime can fan it out as `THINKING` events.
+  - `@dataclass SubagentResponse`: `status: Literal["completed", "input-required", "failed"]`, `content: str`, `session_id: str | None`, `metadata: dict`.
+  - `class SubagentRegistry`: held on `AgentRuntime.subagents`. Methods: `register(client)`, `unregister(name)`, `list()`, `get(name)`.
+  - `class SubagentTimeout(Exception)`: raised when the SSE stream stalls past the per-call timeout.
 
 - `subagents/a2a.py`:
-  - `class A2ASubagent(SubagentClient)` — speaks A2A over HTTP.
-  - Constructor: `A2ASubagent(card: AgentCard, auth: Callable[[AgentCard], dict] | None = None, show_when: Predicate | None = None)`.
+  - `class A2ASubagent(SubagentClient)` — implements the A2A flow over `httpx.AsyncClient`.
+  - Constructor: `A2ASubagent(card: AgentCard, auth: dict[str, str] | Callable[[], dict[str, str]] | None = None, show_when: Predicate | None = None)`.
   - `consult()` implementation:
-    1. Build an A2A task with the message and `contextId=session_id`.
-    2. POST to `card.url` per the A2A spec.
-    3. Stream task status via SSE; collect updates; resolve when state is `completed` or `failed`.
-    4. Extract the final assistant message from the task's message history.
-    5. Return `SubagentResponse(content=..., session_id=task.contextId, metadata={...})`.
-  - Session persistence: store `session_id` per (project_id, subagent_name) at `<project>/subagents/<name>.session.json` via the project namespace adapter. Read on entry to `consult()`, write the response's `session_id` on success.
+    1. Resolve `auth` headers (call if callable).
+    2. POST `{message, contextId: session_id}` to `card.url` per the A2A spec.
+    3. Open SSE stream on the returned task endpoint.
+    4. For each `working` event: extract text delta, call `on_progress` if set.
+    5. Watchdog: if no inbound bytes for 60 s, abort and raise `SubagentTimeout`.
+    6. On terminal event: return `SubagentResponse(status, content, session_id=task.contextId, metadata)`.
 
 - `subagents/registry.py`:
   - `class AgentRegistry(ABC)`:
@@ -450,58 +467,57 @@ Three planned pieces of work. Each item below is intentionally self-contained �
     async def search(
         self,
         query: str | None = None,
-        capabilities: list[str] | None = None,
         tags: list[str] | None = None,
-        provider: str | None = None,
-        max_cost_per_call: float | None = None,
         limit: int = 100,
     ) -> list[AgentCard]: ...
 
-    async def get(self, agent_id: str) -> AgentCard: ...
+    async def get(self, name: str) -> AgentCard: ...
     ```
-  - `HttpAgentRegistry(AgentRegistry)` — talks to an A2A-compatible registry over HTTP.
-  - `StaticAgentRegistry(AgentRegistry)` — list of `AgentCard`s held in code (for tests and small deployments).
-  - Helper `async def load_subagents_from_registry(runtime, registry, **filters) -> list[A2ASubagent]` that searches, wraps each card, registers each on the runtime.
+  - `class StaticAgentRegistry(AgentRegistry)` — in-code list of `AgentCard`s. Filters in memory by walking cards. Default for tests and small deployments.
+  - `class HttpAgentRegistry(AgentRegistry)` — talks to a corporate registry service. Constructor takes `base_url`, `auth`, and an optional `query_param_mapping` callable so different registry backends can be adapted without subclassing.
+  - Helper `async def load_subagents_from_registry(runtime, registry, **filters) -> list[A2ASubagent]` — searches, wraps each card as `A2ASubagent`, registers each on the runtime. Returns the list it registered.
 
 **Runtime integration:**
 
-- `PromptBuilder` adds a new section after the action list:
+- `PromptBuilder` adds a new section after the actions:
   ```markdown
   ## Available Subagents (external specialists)
 
-  ### `consult_legal_research(message: str) -> str`
+  ### `consult_legal_research(message: str, session_id: str | None = None) -> str`
   [card.description]
   Skills: [card.skills joined]
-  Provider: [card.provider] · contextId persisted across calls.
+  Provider: [card.provider] · session_id round-trips through this tool's response — pass it back to continue the same A2A context.
   ```
   Only registered subagents whose `show_when` matches are shown (consistent with item 1).
 
-- `AgentRuntime._execute_call`: when the LLM tool-calls `consult_<name>`, dispatch to the subagent registry rather than to `getattr(world, name)`. Otherwise the wrapping (audit log, hook firing, OutputEvent emission) is the same.
+- The runtime also exposes the **`search_event_log`** built-in meta-tool (item 4) at all times. No registration needed; every runtime gets it.
 
-- Audit log line: `consult_legal_research(message='...') → '...' [session abc, 1.2s]`. Subagent calls show up in `event_log.md` alongside `@actions`.
+- `AgentRuntime._execute_call`: dispatch logic recognises three tool-call categories:
+  1. `consult_<name>` → subagent registry
+  2. `search_event_log` → event search module (item 4)
+  3. anything else → `getattr(world, name)` (`@action`)
 
-- Hooks: add two new event kinds to `HookRegistry`: `pre_subagent_call(name=None)` and `post_subagent_call(name=None)`. Existing `pre_action` / `post_action` do NOT fire for subagents — different semantic category, different policies (e.g. cost ceilings).
+  All three categories produce TOOL messages and event-log entries; only `@action` and `consult_*` go through the CAS-append path (search is read-only). Hook firing differs per category — see below.
+
+- Subagent consults are recorded as events with `action_name="consult_<name>"`, args/kwargs reflecting the LLM-supplied call, and `result_summary` carrying status + a content excerpt + the returned `session_id`. This makes them first-class in `event_log.md` and discoverable via `search_event_log`.
+
+- Hooks: add two new event kinds to `HookRegistry`: `pre_subagent_call(name=None)` and `post_subagent_call(name=None)`. Existing `pre_action` / `post_action` do NOT fire for subagents — different semantic category, different policies. `search_event_log` does not fire any hook (read-only meta-tool).
 
 **Dependencies:**
 
-- An async A2A client library. If a maintained Python A2A client exists at implementation time, use it. Otherwise implement a minimal client over `httpx` + SSE following the A2A spec.
+- `httpx` (already a dep). Add `httpx-sse` (small, well-maintained) for SSE parsing — or hand-roll the line buffer if we want zero new deps. Decide at implementation time.
 
 **Acceptance criteria:**
 
-- Can register a subagent directly: `runtime.subagents.register(A2ASubagent(card))`.
-- Can bulk-load via a registry: `await load_subagents_from_registry(runtime, registry, capabilities=["legal-research"])`.
-- LLM can call `consult_<name>(message)`; response is returned as a TOOL message.
-- Session persistence works across runs: second call to the same subagent sees the prior `contextId`.
-- Audit log records every subagent call with timing and metadata.
-- `pre_subagent_call` and `post_subagent_call` hooks fire correctly; `pre_action` and `post_action` do NOT fire for subagents.
-- The codebase contains no non-A2A subagent client (no `HttpJsonSubagent`, no `OpenAIAssistantSubagent`, etc.).
-
-**Open questions to resolve during implementation:**
-
-- Auth: should `AgentCard.authentication` carry per-card credentials (simple but credentials in registry), or should the registry resolve auth on the caller's behalf and return pre-authenticated `Bearer` tokens?
-- Cost ceiling: built-in per-run budget enforced via a default `pre_subagent_call` hook, or leave it to operators?
-- A2A task streaming: surface `working → working → completed` updates to the OutputChannel as `OutputEventKind.THINKING` events for UX, or hide them?
-- A `revise` decision (see item 3): a subagent response that says "I need more info" maps to A2A's `input-required` state. For v1 treat as an error; multi-turn task continuation is a future enhancement.
+- Can register a subagent directly: `runtime.subagents.register(A2ASubagent(card, auth={"Authorization": "Bearer ..."}))`.
+- Can bulk-load via a registry: `await load_subagents_from_registry(runtime, registry, tags=["legal"])`.
+- LLM can call `consult_<name>(message)` and `consult_<name>(message, session_id="ctx-abc")`; both return TOOL messages containing status + content + session_id.
+- `input-required` is surfaced cleanly as a TOOL message ("the subagent needs clarification: …; reply with another `consult_<name>(message=…, session_id=…)`") — not as an error.
+- `working` events arrive on the `OutputChannel` as `THINKING` events for any registered subagent.
+- `SubagentTimeout` fires when no inbound traffic arrives within 60 s; it surfaces as a TOOL error.
+- Every subagent call writes one entry to the event log; `search_event_log(action_name_glob="consult_*")` returns them.
+- `pre_subagent_call` and `post_subagent_call` hooks fire correctly; `pre_action` and `post_action` do NOT.
+- The codebase contains no non-A2A subagent client and no separate `<project>/subagent_sessions.json` storage.
 
 ---
 
@@ -644,3 +660,83 @@ Decide one of:
 - Deterministic IDs on replay — `new_id()` currently produces fresh UUIDs. v1 fix: each action that creates IDs takes the id from the event payload during replay (event carries `result_payload` with any generated IDs; replay assigns them back rather than calling `new_id()`).
 - Wall-clock determinism — every `datetime.now()` inside an `@action` must be replaced with `self._now()` which reads from the event's `timestamp` during replay and from the system clock during live execution.
 - Whether the structural pre-check's `reads`/`writes` should be inferred from the method body via AST (later) rather than declared by the implementer.
+
+---
+
+### 4. `search_event_log` — built-in queryable view over the project event log
+
+**Status:** done (shipped as part of task 2)
+
+**Goal:** the LLM does not have the full event log in its system prompt — only the tail (the last ~12 lines lifted into Recent Activity). For long-running projects with thousands of events, the agent needs a way to find specific past activity (e.g. "did I already ask `legal_research` about Acme?"). A built-in meta-tool gives every runtime a uniform way to grep the project's history.
+
+**Why a separate module:** the same search is useful to (a) the LLM via a tool call, (b) a human via a CLI command, (c) other agents inspecting the project over A2A. Keeping the query logic in one module — `event_search.py` — avoids three slightly-different implementations.
+
+**Module `distributed_agent_harness/event_search.py`:**
+
+- `@dataclass EventQuery`:
+  ```python
+  action_name_glob: str | None = None   # "consult_*", "register_data_subject", etc.
+  grep: str | None = None               # case-insensitive substring over the rendered line
+  actor: str | None = None              # "agent" | "human" | "subagent:<name>"
+  since: datetime | None = None
+  until: datetime | None = None
+  limit: int = 20
+  offset_from: int | None = None        # log offset to start from (paginate)
+  ```
+- `async def search_events(eventlog, project_id, query) -> list[Event]`: returns events matching the query, sorted by offset descending (most recent first), respecting `limit`.
+- `def render_events_markdown(events) -> str`: identical line format to `event_log.md` so the LLM's mental model is consistent. Includes `offset` so the agent can paginate.
+
+**Runtime integration:**
+
+- The runtime exposes `search_event_log` as a tool schema **at all times**, alongside `@actions` and `consult_*`. No registration required.
+- Dispatch in `_execute_call`: recognise the special name, build an `EventQuery` from the tool-call arguments, call `search_events`, return rendered markdown as the TOOL message.
+- Read-only: does **not** append an event to the log, does **not** flush a snapshot, does **not** fire any hook. `pre_action` and `pre_subagent_call` are skipped.
+
+**Other surfaces (deferred to item 2's CLI follow-up but the module supports them):**
+
+- CLI `python -m distributed_agent_harness.search --project=<id> --grep=Acme`.
+- Other agents over A2A: any agent observing the project can call `search_event_log` via the harness API.
+
+**Acceptance criteria:**
+
+- `search_event_log` appears in every runtime's tool schemas.
+- The LLM can call it with any combination of `action_name_glob`, `grep`, `actor`, `since`, `until`, `limit`, `offset_from`.
+- Returned markdown matches the `event_log.md` line format and includes offsets.
+- Calling `search_event_log` does NOT append to the event log.
+- A test confirms `search_event_log(action_name_glob="consult_*")` returns only subagent consult events from a mixed log.
+
+---
+
+### 5. In-process subagent ABC (asyncio / subprocess / messaging variants)
+
+**Status:** planned
+
+**Goal:** register subagents that run *inside the harness* — on the same event loop, in a subprocess, or behind a project-bus topic — without going through an HTTP+SSE boundary. The LLM-facing interface is the same `consult_<name>(message, session_id)` tool surfaced by task 2; only the transport differs.
+
+**Why:** some specialists are too tightly coupled to the project to deserve their own service (e.g. a structured-output classifier that needs to read project state, a batch document chunker, a domain-specific summariser). Spinning up a separate process per role is overkill; embedding them as `@actions` blurs the action vocabulary.
+
+**Module `distributed_agent_harness/subagents/inprocess/` (new):**
+
+- `class InProcessSubagent(SubagentClient)` — abstract base; subclasses choose the execution model.
+- `class AsyncSubagent(InProcessSubagent)` — `consult()` runs an async function on the same loop.
+- `class ProcessSubagent(InProcessSubagent)` — spawns a subprocess (isolation, can carry its own dependencies); pipes the message in, reads the response out.
+- `class MessagingSubagent(InProcessSubagent)` — publishes the request to the project's message bus (same Kafka the event log uses) and consumes the response from a per-call response topic.
+
+**Conversation history (key difference from A2A subagents):**
+
+- Unlike A2A subagents, in-process subagents store their conversation **under the project namespace**, at `<project>/subagents/<name>/conversation.jsonl` (one message per line).
+- The harness owns this directory; the subagent reads/writes via the project's `NamespaceAdapter`. Same multi-backend story applies (S3, SharePoint, etc.).
+- `session_id` for in-process subagents is the path itself (or a hash of it) — round-trips through the TOOL response exactly like A2A subagents, so the LLM's interface is uniform.
+
+**Acceptance criteria:**
+
+- Three working subclasses: `AsyncSubagent`, `ProcessSubagent`, `MessagingSubagent`.
+- A registered in-process subagent appears in the prompt and is callable identically to an A2A subagent.
+- Its conversation persists under `<project>/subagents/<name>/conversation.jsonl` across runs.
+- The runtime treats it as a subagent for hooks (`pre_subagent_call` / `post_subagent_call`), not as an action.
+
+**Open questions:**
+
+- Should `AsyncSubagent` get its own conflict-resolution semantics if it mutates project state, or stay strictly read-only?
+- Lifecycle of subprocess subagents — spawn-per-call vs persistent worker pool.
+- For `MessagingSubagent`, define the request/response envelope on the Kafka topic.

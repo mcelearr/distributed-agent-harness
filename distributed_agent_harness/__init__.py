@@ -12,6 +12,7 @@ from .conflict import (
     Recover,
     ScriptedResolver,
 )
+from .event_search import EventQuery, render_events_markdown, search_events
 from .eventlog import (
     Appended,
     AppendResult,
@@ -26,9 +27,12 @@ from .hooks import (
     BlockDecision,
     HookRegistry,
     PostActionHook,
+    PostSubagentCallHook,
     PreActionHook,
+    PreSubagentCallHook,
     PreTriggerHook,
     RunCompleteHook,
+    SubagentContext,
 )
 from .llm import (
     CompletionChunk,
@@ -41,6 +45,19 @@ from .llm import (
 from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
 from .runtime import AgentRuntime
+from .subagents import (
+    A2ASubagent,
+    AgentCard,
+    AgentRegistry,
+    HttpAgentRegistry,
+    Skill,
+    StaticAgentRegistry,
+    SubagentClient,
+    SubagentRegistry,
+    SubagentResponse,
+    SubagentTimeout,
+    load_subagents_from_registry,
+)
 from .transport import (
     OutputChannel,
     OutputEvent,
@@ -94,12 +111,31 @@ __all__ = [
     # Hooks
     "HookRegistry",
     "ActionContext",
+    "SubagentContext",
     "BlockDecision",
     "PreActionHook",
     "PostActionHook",
     "ActionErrorHook",
     "PreTriggerHook",
     "RunCompleteHook",
+    "PreSubagentCallHook",
+    "PostSubagentCallHook",
+    # Event search
+    "EventQuery",
+    "search_events",
+    "render_events_markdown",
+    # Subagents
+    "SubagentClient",
+    "SubagentResponse",
+    "SubagentRegistry",
+    "SubagentTimeout",
+    "AgentCard",
+    "Skill",
+    "A2ASubagent",
+    "AgentRegistry",
+    "StaticAgentRegistry",
+    "HttpAgentRegistry",
+    "load_subagents_from_registry",
     # Runtime
     "AgentRuntime",
 ]

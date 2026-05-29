@@ -21,6 +21,8 @@ from typing import Any, Type
 
 from pydantic import ValidationError, create_model
 
+from datetime import datetime, timezone
+
 from .conflict import (
     Abandon,
     AgentDrivenConflictResolver,
@@ -31,13 +33,20 @@ from .conflict import (
     Recover,
     fields_disjoint,
 )
-from .eventlog import EventLog
-from .hooks import ActionContext, BlockDecision, HookRegistry
+from .event_search import EventQuery, render_events_markdown, search_events
+from .eventlog import Appended, Event, EventLog
+from .hooks import ActionContext, BlockDecision, HookRegistry, SubagentContext
 from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
+from .subagents import SubagentRegistry, SubagentResponse, SubagentTimeout
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
 from .world import ActionNotAvailable, BaseWorldEnvironment
+
+
+# Reserved built-in tool names (cannot be used as @action names without clash)
+_SEARCH_EVENT_LOG_TOOL = "search_event_log"
+_SUBAGENT_TOOL_PREFIX = "consult_"
 
 log = logging.getLogger(__name__)
 
@@ -108,9 +117,12 @@ class AgentRuntime:
         self.system_preamble = system_preamble
         self.hooks = hooks if hooks is not None else HookRegistry()
         self.conflict_resolver = conflict_resolver or AgentDrivenConflictResolver()
+        self.subagents = SubagentRegistry()
         self._builder = PromptBuilder(world_class, include_source=include_source_in_prompt)
-        # Cache tool schemas — they're derived from class definitions, not state
-        self._tool_schemas, self._param_models = _build_tool_schemas(world_class)
+        # Cache tool schemas for @actions; subagent + meta-tool schemas are
+        # appended dynamically per turn because subagents can be registered
+        # after the runtime is created.
+        self._action_tool_schemas, self._param_models = _build_tool_schemas(world_class)
         self._action_writes = world_class.action_writes_by_name()
 
     # ----------------------------------------------------------------------- #
@@ -197,7 +209,8 @@ class AgentRuntime:
                 system_message = self._build_system_message(world, event=event)
                 messages = [system_message, user_message, *conversation]
 
-                assistant = await self.llm.chat_complete(messages, tools=self._tool_schemas)
+                turn_tools = self._tool_schemas_for_turn(world, event)
+                assistant = await self.llm.chat_complete(messages, tools=turn_tools)
                 conversation.append(assistant)
 
                 if not assistant.tool_calls:
@@ -304,7 +317,9 @@ class AgentRuntime:
         content = (
             self.system_preamble
             + "\n\n"
-            + self._builder.build_full_prompt(world, event=event)
+            + self._builder.build_full_prompt(
+                world, event=event, subagents=self.subagents.list(),
+            )
         )
         return Message(role=Role.SYSTEM, content=content)
 
@@ -329,12 +344,31 @@ class AgentRuntime:
         reply_to: Any,
         trigger: TriggerEvent,
     ) -> Message:
-        """Run one tool call against the WorldEnvironment and return a TOOL message."""
+        """Run one tool call and return a TOOL message.
+
+        Three dispatch categories:
+        - ``search_event_log``    → read-only meta-tool, no hooks, no event append
+        - ``consult_<name>``      → subagent registry
+        - any other name          → ``@action`` on the WorldEnvironment
+        """
         if reply_to:
             await reply_to.emit(OutputEvent(
                 kind=OutputEventKind.ACTION_CALLED,
                 payload={"name": call.name, "args": call.arguments, "id": call.id},
             ))
+
+        # ----- meta-tool: search_event_log
+        if call.name == _SEARCH_EVENT_LOG_TOOL:
+            return await self._execute_search_event_log(call, world, reply_to)
+
+        # ----- subagent: consult_<name>
+        if call.name.startswith(_SUBAGENT_TOOL_PREFIX):
+            subagent_name = call.name[len(_SUBAGENT_TOOL_PREFIX):]
+            subagent = self.subagents.get(subagent_name)
+            if subagent is not None:
+                return await self._execute_subagent_call(
+                    call, subagent_name, subagent, world, reply_to, trigger,
+                )
 
         method = getattr(world, call.name, None)
         if method is None or not getattr(method, "_is_action", False):
@@ -555,6 +589,259 @@ class AgentRuntime:
                 # Unknown decision type — treat as Recover.
                 return Recover(), None
 
+    # ----------------------------------------------------------------------- #
+    # Tool dispatch — subagent (consult_<name>)                                #
+    # ----------------------------------------------------------------------- #
+
+    async def _execute_subagent_call(
+        self,
+        call: ToolCall,
+        subagent_name: str,
+        subagent: Any,
+        world: BaseWorldEnvironment,
+        reply_to: Any,
+        trigger: TriggerEvent,
+    ) -> Message:
+        """Dispatch a ``consult_<name>`` tool call to the subagent registry."""
+        message = call.arguments.get("message")
+        session_id = call.arguments.get("session_id")
+        if not isinstance(message, str) or not message:
+            error = f"Invalid arguments for {call.name}: 'message' is required"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={"name": call.name, "id": call.id, "error": error},
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+
+        # ----- pre_subagent_call hook
+        sub_ctx = SubagentContext(
+            project_id=world._project_id,
+            subagent_name=subagent_name,
+            message=message,
+            session_id=session_id if isinstance(session_id, str) else None,
+            trigger=trigger,
+        )
+        decision = await self.hooks.fire_pre_subagent_call(sub_ctx)
+        if decision is not None:
+            error = f"Subagent blocked: {decision.reason}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={
+                        "name": call.name, "id": call.id,
+                        "error": error, "blocked": True,
+                    },
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+
+        # ----- progress callback: forward `working` deltas as THINKING events
+        async def _on_progress(delta: str) -> None:
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.THINKING,
+                    payload={
+                        "subagent": subagent_name,
+                        "delta": delta,
+                    },
+                ))
+
+        # ----- the consult itself
+        try:
+            response: SubagentResponse = await subagent.consult(
+                message=message,
+                session_id=sub_ctx.session_id,
+                on_progress=_on_progress,
+            )
+        except SubagentTimeout as exc:
+            await self._append_subagent_event(
+                world, subagent_name, message, sub_ctx.session_id,
+                status="failed", content=f"timeout: {exc}",
+            )
+            error = f"Subagent timed out: {exc}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={"name": call.name, "id": call.id, "error": error},
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface to LLM
+            await self._append_subagent_event(
+                world, subagent_name, message, sub_ctx.session_id,
+                status="failed", content=str(exc),
+            )
+            error = f"Subagent error: {type(exc).__name__}: {exc}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={"name": call.name, "id": call.id, "error": error},
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+
+        # ----- record the consult event
+        await self._append_subagent_event(
+            world, subagent_name, message, sub_ctx.session_id,
+            status=response.status,
+            content=response.content,
+            returned_session_id=response.session_id,
+        )
+
+        # ----- post_subagent_call hook
+        await self.hooks.fire_post_subagent_call(sub_ctx, response)
+
+        result_text = _render_subagent_response(subagent_name, response)
+        if reply_to:
+            await reply_to.emit(OutputEvent(
+                kind=OutputEventKind.ACTION_RESULT,
+                payload={
+                    "name": call.name, "id": call.id,
+                    "result": result_text,
+                    "status": response.status,
+                    "session_id": response.session_id,
+                },
+            ))
+        return Message(
+            role=Role.TOOL,
+            content=result_text,
+            tool_call_id=call.id,
+            name=call.name,
+        )
+
+    async def _append_subagent_event(
+        self,
+        world: BaseWorldEnvironment,
+        subagent_name: str,
+        message: str,
+        session_id: str | None,
+        status: str,
+        content: str,
+        returned_session_id: str | None = None,
+    ) -> None:
+        """Append a `consult_<name>` event with transparent CAS retry.
+
+        Subagent consults don't depend on the world's state, so any
+        intervening @action writes cannot invalidate them — we just keep
+        trying until our append wins. No conflict is surfaced to the LLM.
+        """
+        event = Event(
+            project_id=world._project_id,
+            action_name=f"{_SUBAGENT_TOOL_PREFIX}{subagent_name}",
+            args=[],
+            kwargs={
+                "message": _truncate_for_log(message),
+                "session_id": session_id,
+            },
+            actor="agent",
+            result_summary=(
+                f"status={status} session={returned_session_id or session_id} "
+                f"content={_truncate_for_log(content)}"
+            ),
+        )
+        while True:
+            offset = await self.eventlog.current_offset(world._project_id)
+            result = await self.eventlog.append(
+                world._project_id, event, expected_offset=offset,
+            )
+            if isinstance(result, Appended):
+                return
+            # Conflict — refresh and try again. Subagent calls are
+            # commutative w.r.t. any concurrent @action.
+
+    # ----------------------------------------------------------------------- #
+    # Tool dispatch — search_event_log (read-only meta-tool)                   #
+    # ----------------------------------------------------------------------- #
+
+    async def _execute_search_event_log(
+        self,
+        call: ToolCall,
+        world: BaseWorldEnvironment,
+        reply_to: Any,
+    ) -> Message:
+        """Dispatch the built-in ``search_event_log`` meta-tool."""
+        args = call.arguments or {}
+        try:
+            query = EventQuery(
+                action_name_glob=args.get("action_name_glob"),
+                grep=args.get("grep"),
+                actor=args.get("actor"),
+                since=_parse_iso_datetime(args.get("since")),
+                until=_parse_iso_datetime(args.get("until")),
+                limit=int(args.get("limit") or 20),
+                offset_from=(
+                    int(args["offset_from"]) if args.get("offset_from") is not None else None
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            error = f"Invalid arguments for search_event_log: {exc}"
+            if reply_to:
+                await reply_to.emit(OutputEvent(
+                    kind=OutputEventKind.ACTION_RESULT,
+                    payload={"name": call.name, "id": call.id, "error": error},
+                ))
+            return Message(
+                role=Role.TOOL,
+                content=error,
+                tool_call_id=call.id,
+                name=call.name,
+            )
+
+        events = await search_events(self.eventlog, world._project_id, query)
+        result_text = render_events_markdown(events)
+        if reply_to:
+            await reply_to.emit(OutputEvent(
+                kind=OutputEventKind.ACTION_RESULT,
+                payload={"name": call.name, "id": call.id, "result": result_text},
+            ))
+        return Message(
+            role=Role.TOOL,
+            content=result_text,
+            tool_call_id=call.id,
+            name=call.name,
+        )
+
+    # ----------------------------------------------------------------------- #
+    # Per-turn tool schema assembly                                            #
+    # ----------------------------------------------------------------------- #
+
+    def _tool_schemas_for_turn(
+        self,
+        world: BaseWorldEnvironment,
+        event: TriggerEvent | None,
+    ) -> list[ToolSchema]:
+        """Return the full tool list visible to the LLM this turn.
+
+        Composition:
+        - all ``@action`` schemas whose ``show_when`` matches current state
+        - one ``consult_<name>`` schema per registered subagent whose
+          ``show_when`` matches
+        - the built-in ``search_event_log`` meta-tool
+        """
+        visible_actions = _visible_action_names(self.world_class, world.state, event)
+        schemas = [s for s in self._action_tool_schemas if s.name in visible_actions]
+        schemas.extend(_subagent_tool_schemas(self.subagents, world.state, event))
+        schemas.append(_search_event_log_tool_schema())
+        return schemas
+
 
 # --------------------------------------------------------------------------- #
 # Tool schema generation                                                       #
@@ -637,3 +924,173 @@ def _recover_note(offset: int) -> Message:
             "your previous plan is still valid."
         ),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Visibility helpers — used per-turn to filter the tool list                   #
+# --------------------------------------------------------------------------- #
+
+def _visible_action_names(
+    world_class: Type[BaseWorldEnvironment],
+    state: Any,
+    event: TriggerEvent | None,
+) -> set[str]:
+    """Return action names whose ``show_when`` matches now (or is unset)."""
+    visible: set[str] = set()
+    for name, method in world_class.get_actions().items():
+        predicate = getattr(method, "_show_when", None)
+        if predicate is None:
+            visible.add(name)
+            continue
+        try:
+            if bool(predicate(state, event)):
+                visible.add(name)
+        except Exception:  # noqa: BLE001 — buggy predicate hides the action
+            log.exception("show_when raised for %r; hiding action", name)
+    return visible
+
+
+def _subagent_tool_schemas(
+    registry: SubagentRegistry,
+    state: Any,
+    event: TriggerEvent | None,
+) -> list[ToolSchema]:
+    """One ``consult_<name>`` schema per registered subagent (filtered by show_when)."""
+    schemas: list[ToolSchema] = []
+    for sub in registry.list():
+        predicate = getattr(sub, "show_when", None)
+        if predicate is not None:
+            try:
+                if not bool(predicate(state, event)):
+                    continue
+            except Exception:  # noqa: BLE001
+                log.exception("subagent %r show_when raised; hiding", sub.name)
+                continue
+        schemas.append(ToolSchema(
+            name=f"{_SUBAGENT_TOOL_PREFIX}{sub.name}",
+            description=(
+                f"{sub.description}\n\n"
+                "Consult the external specialist. Pass session_id from a "
+                "prior response to continue the same conversation context; "
+                "omit it to start fresh."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The prompt to send the subagent.",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional A2A contextId from a prior response. "
+                            "When set, the subagent resumes that conversation."
+                        ),
+                    },
+                },
+                "required": ["message"],
+            },
+        ))
+    return schemas
+
+
+def _search_event_log_tool_schema() -> ToolSchema:
+    """The built-in meta-tool every runtime exposes."""
+    return ToolSchema(
+        name=_SEARCH_EVENT_LOG_TOOL,
+        description=(
+            "Search this project's event log. All filters are optional and "
+            "compose with AND. Use this when Recent Activity in the system "
+            "prompt is too short to answer a question about prior activity — "
+            "for example to find a prior consult_<subagent> session_id, or "
+            "to confirm whether a particular action has already been taken."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action_name_glob": {
+                    "type": "string",
+                    "description": (
+                        "fnmatch glob over action names. "
+                        "Examples: 'consult_*' (all subagent calls), "
+                        "'consult_legal_research' (one specific subagent), "
+                        "'notify_*' (everything starting with notify_)."
+                    ),
+                },
+                "grep": {
+                    "type": "string",
+                    "description": "Case-insensitive substring over the rendered line.",
+                },
+                "actor": {
+                    "type": "string",
+                    "description": "Exact match on actor (e.g. 'agent', 'human').",
+                },
+                "since": {
+                    "type": "string",
+                    "description": "ISO 8601 timestamp — only events at or after this time.",
+                },
+                "until": {
+                    "type": "string",
+                    "description": "ISO 8601 timestamp — only events before this time.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results. Default 20.",
+                },
+                "offset_from": {
+                    "type": "integer",
+                    "description": "Only events at log offset >= this value (for pagination).",
+                },
+            },
+            "required": [],
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Subagent response rendering + small utilities                                #
+# --------------------------------------------------------------------------- #
+
+def _render_subagent_response(
+    subagent_name: str,
+    response: SubagentResponse,
+) -> str:
+    """Format a SubagentResponse as the TOOL-message body the LLM reads.
+
+    The status word is at the start so the LLM can branch on it quickly.
+    For ``input-required`` we tell the model exactly what to do — call
+    consult_<name> again with the same session_id.
+    """
+    parts = [f"[{response.status}]"]
+    if response.session_id:
+        parts.append(f"session_id={response.session_id}")
+    parts.append(response.content or "")
+    body = " ".join(p for p in parts if p)
+    if response.status == "input-required":
+        body += (
+            f"\n\nTo continue, call `consult_{subagent_name}` again with "
+            f"`session_id=\"{response.session_id}\"` and your reply as `message`."
+        )
+    return body
+
+
+def _truncate_for_log(text: str, max_len: int = 80) -> str:
+    """Trim long strings for compact event-log entries."""
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    """Parse an ISO-8601 string; return None for empty/None inputs."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    if not isinstance(raw, str):
+        raise TypeError(f"expected ISO-8601 string, got {type(raw).__name__}")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed

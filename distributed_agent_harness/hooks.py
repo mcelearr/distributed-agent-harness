@@ -54,13 +54,28 @@ class ActionContext:
     trigger: "TriggerEvent | None" = None   # the TriggerEvent that led here, if any
 
 
+@dataclass
+class SubagentContext:
+    """Context passed to subagent-level hooks (pre_subagent_call, post_subagent_call).
+
+    A distinct shape from ``ActionContext`` because subagent policies are
+    semantically different (cost ceilings, allowlists, session tracking).
+    """
+    project_id: str
+    subagent_name: str
+    message: str
+    session_id: str | None = None
+    trigger: "TriggerEvent | None" = None
+
+
 @dataclass(frozen=True)
 class BlockDecision:
     """
     Returned by a pre-* hook to halt the operation.
 
-    The runtime surfaces the ``reason`` to the LLM (for blocked actions) or
-    to the OutputChannel as an ERROR event (for blocked triggers).
+    The runtime surfaces the ``reason`` to the LLM (for blocked actions or
+    subagents) or to the OutputChannel as an ERROR event (for blocked
+    triggers).
     """
     reason: str
 
@@ -71,6 +86,8 @@ PostActionHook = Callable[[ActionContext, Any], Awaitable[None]]
 ActionErrorHook = Callable[[ActionContext, BaseException], Awaitable[None]]
 PreTriggerHook = Callable[["TriggerEvent"], Awaitable["BlockDecision | None"]]
 RunCompleteHook = Callable[["TriggerEvent", "Message"], Awaitable[None]]
+PreSubagentCallHook = Callable[[SubagentContext], Awaitable["BlockDecision | None"]]
+PostSubagentCallHook = Callable[[SubagentContext, Any], Awaitable[None]]
 
 
 # --------------------------------------------------------------------------- #
@@ -110,6 +127,8 @@ class HookRegistry:
         self._action_error: dict[str | None, list[ActionErrorHook]] = {}
         self._pre_trigger: list[PreTriggerHook] = []
         self._run_complete: list[RunCompleteHook] = []
+        self._pre_subagent_call: dict[str | None, list[PreSubagentCallHook]] = {}
+        self._post_subagent_call: dict[str | None, list[PostSubagentCallHook]] = {}
 
     # ----------------------------------------------------------------------- #
     # Registration — decorators                                                #
@@ -160,6 +179,31 @@ class HookRegistry:
         """Register a hook that fires when an agent run finishes."""
         self._run_complete.append(fn)
         return fn
+
+    def on_pre_subagent_call(
+        self, name: str | None = None
+    ) -> Callable[[PreSubagentCallHook], PreSubagentCallHook]:
+        """Register a hook that fires before a subagent ``consult`` runs.
+
+        Returning a ``BlockDecision`` halts the call and surfaces the
+        reason to the LLM as a blocked TOOL message — same shape as a
+        blocked ``pre_action``. Use for cost ceilings, allowlists, etc.
+
+        Pass ``name=None`` (default) to fire for every subagent.
+        """
+        def decorator(fn: PreSubagentCallHook) -> PreSubagentCallHook:
+            self._pre_subagent_call.setdefault(name, []).append(fn)
+            return fn
+        return decorator
+
+    def on_post_subagent_call(
+        self, name: str | None = None
+    ) -> Callable[[PostSubagentCallHook], PostSubagentCallHook]:
+        """Register a hook that fires after a subagent ``consult`` returns."""
+        def decorator(fn: PostSubagentCallHook) -> PostSubagentCallHook:
+            self._post_subagent_call.setdefault(name, []).append(fn)
+            return fn
+        return decorator
 
     # ----------------------------------------------------------------------- #
     # Firing — called by AgentRuntime                                          #
@@ -217,3 +261,28 @@ class HookRegistry:
                 await hook(event, final)
             except Exception:
                 log.exception("run_complete hook raised; ignoring")
+
+    async def fire_pre_subagent_call(
+        self, ctx: SubagentContext
+    ) -> BlockDecision | None:
+        """Run all matching pre_subagent_call hooks. Return first BlockDecision."""
+        for key in (ctx.subagent_name, None):
+            for hook in self._pre_subagent_call.get(key, []):
+                result = await hook(ctx)
+                if isinstance(result, BlockDecision):
+                    return result
+        return None
+
+    async def fire_post_subagent_call(
+        self, ctx: SubagentContext, response: Any
+    ) -> None:
+        """Run all matching post_subagent_call hooks. Exceptions are logged."""
+        for key in (ctx.subagent_name, None):
+            for hook in self._post_subagent_call.get(key, []):
+                try:
+                    await hook(ctx, response)
+                except Exception:
+                    log.exception(
+                        "post_subagent_call hook for %r raised; ignoring",
+                        ctx.subagent_name,
+                    )

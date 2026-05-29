@@ -129,18 +129,111 @@ class PromptBuilder:
         state_json = world.state.model_dump_json(indent=2)
         return f"## Current State (exact values)\n\n```json\n{state_json}\n```"
 
+    def build_subagents_prompt(
+        self,
+        subagents: list[Any] | None,
+        state: Any = None,
+        event: "TriggerEvent | None" = None,
+    ) -> str | None:
+        """Return the "Available Subagents" section.
+
+        Lists each registered subagent as ``consult_<name>(message, session_id)``.
+        Filtered by ``show_when`` against the current state when both ``state``
+        and ``event`` are provided. Returns None when there are no visible
+        subagents — the runtime then skips the section entirely.
+        """
+        if not subagents:
+            return None
+
+        visible: list[Any] = []
+        for sub in subagents:
+            predicate = getattr(sub, "show_when", None)
+            if predicate is None or state is None:
+                visible.append(sub)
+                continue
+            try:
+                if bool(predicate(state, event)):
+                    visible.append(sub)
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "subagent %r show_when raised; hiding from prompt",
+                    getattr(sub, "name", "?"),
+                )
+
+        if not visible:
+            return None
+
+        lines = ["## Available Subagents (external specialists)\n"]
+        for sub in sorted(visible, key=lambda s: s.name):
+            lines.append(self._format_subagent(sub))
+        return "\n\n".join(lines)
+
+    def build_search_event_log_prompt(self) -> str:
+        """Return the always-on "Searching the Event Log" section.
+
+        Tells the LLM that ``search_event_log`` exists and when to reach for it.
+        """
+        return (
+            "## Searching the Event Log\n\n"
+            "Recent Activity above shows only the last few entries. For older "
+            "history — finding a prior `consult_<subagent>` session_id, "
+            "confirming whether a particular action has already been taken, "
+            "or building a picture of subagent activity on this project — "
+            "call `search_event_log` with filters such as "
+            "`action_name_glob='consult_*'`."
+        )
+
     def build_full_prompt(
         self,
         world: "BaseWorldEnvironment",
         event: "TriggerEvent | None" = None,
+        subagents: list[Any] | None = None,
     ) -> str:
-        """Return the complete system prompt in the standard section order."""
-        return "\n\n---\n\n".join([
+        """Return the complete system prompt in the standard section order.
+
+        Sections, in order:
+        1. Project Summary
+        2. Available Actions
+        3. Available Subagents (omitted when none registered / visible)
+        4. Searching the Event Log
+        5. Recent Activity
+        6. Current State
+        """
+        sections = [
             self.build_summary_prompt(world),
             self.build_actions_prompt(world, event=event),
+        ]
+        subagents_section = self.build_subagents_prompt(
+            subagents, state=world.state, event=event,
+        )
+        if subagents_section is not None:
+            sections.append(subagents_section)
+        sections.extend([
+            self.build_search_event_log_prompt(),
             self.build_recent_activity_prompt(world),
             self.build_state_prompt(world),
         ])
+        return "\n\n---\n\n".join(sections)
+
+    @staticmethod
+    def _format_subagent(sub: Any) -> str:
+        """Render one subagent entry."""
+        skills_text = ""
+        skills = getattr(getattr(sub, "card", None), "skills", []) or []
+        if skills:
+            skill_names = [s.name for s in skills if getattr(s, "name", None)]
+            if skill_names:
+                skills_text = f"\nSkills: {', '.join(skill_names)}"
+        provider = getattr(getattr(sub, "card", None), "provider", None)
+        provider_text = f"\nProvider: {provider}" if provider else ""
+        return (
+            f"### `consult_{sub.name}(message: str, session_id: str | None = None) -> str`\n"
+            f"{sub.description}"
+            f"{skills_text}"
+            f"{provider_text}\n"
+            "`session_id` round-trips through this tool's response — pass it "
+            "back to continue the same A2A context."
+        )
 
     # ----------------------------------------------------------------------- #
     # Internals — formatting one action                                        #
