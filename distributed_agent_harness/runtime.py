@@ -15,8 +15,10 @@ doesn't block the event loop.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
+import re
 from typing import Any, Type
 
 from pydantic import ValidationError, create_model
@@ -49,7 +51,12 @@ from .namespace_browse import (
     render_read,
 )
 from .prompt_builder import PromptBuilder
-from .subagents import SubagentRegistry, SubagentResponse, SubagentTimeout
+from .subagents import (
+    Artefact,
+    SubagentRegistry,
+    SubagentResponse,
+    SubagentTimeout,
+)
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
 from .world import ActionNotAvailable, BaseWorldEnvironment
 
@@ -742,18 +749,27 @@ class AgentRuntime:
                 name=call.name,
             )
 
+        # ----- persist artefacts before recording the event so the event's
+        # result_summary can include their paths (grep-discoverable later)
+        artefact_records = _persist_artefacts(
+            self.namespace, world._project_id, response.artefacts,
+        )
+
         # ----- record the consult event
         await self._append_subagent_event(
             world, subagent_name, message, sub_ctx.session_id,
             status=response.status,
             content=response.content,
             returned_session_id=response.session_id,
+            artefact_records=artefact_records,
         )
 
         # ----- post_subagent_call hook
         await self.hooks.fire_post_subagent_call(sub_ctx, response)
 
-        result_text = _render_subagent_response(subagent_name, response)
+        result_text = _render_subagent_response(
+            subagent_name, response, artefact_records,
+        )
         if reply_to:
             await reply_to.emit(OutputEvent(
                 kind=OutputEventKind.ACTION_RESULT,
@@ -780,13 +796,26 @@ class AgentRuntime:
         status: str,
         content: str,
         returned_session_id: str | None = None,
+        artefact_records: list[dict] | None = None,
     ) -> None:
         """Append a `consult_<name>` event with transparent CAS retry.
 
         Subagent consults don't depend on the world's state, so any
         intervening @action writes cannot invalidate them — we just keep
         trying until our append wins. No conflict is surfaced to the LLM.
+
+        Artefact paths are inlined into ``result_summary`` so the LLM
+        can rediscover them later via ``search_event_log`` or ``grep``.
         """
+        summary_parts = [
+            f"status={status}",
+            f"session={returned_session_id or session_id}",
+            f"content={_truncate_for_log(content)}",
+        ]
+        if artefact_records:
+            paths_inline = ", ".join(a["path"] for a in artefact_records)
+            summary_parts.append(f"artefacts=[{paths_inline}]")
+
         event = Event(
             project_id=world._project_id,
             action_name=f"{_SUBAGENT_TOOL_PREFIX}{subagent_name}",
@@ -796,10 +825,7 @@ class AgentRuntime:
                 "session_id": session_id,
             },
             actor="agent",
-            result_summary=(
-                f"status={status} session={returned_session_id or session_id} "
-                f"content={_truncate_for_log(content)}"
-            ),
+            result_summary=" ".join(summary_parts),
         )
         while True:
             offset = await self.eventlog.current_offset(world._project_id)
@@ -1303,24 +1329,105 @@ def _coerce_optional_int(value: Any) -> int | None:
 def _render_subagent_response(
     subagent_name: str,
     response: SubagentResponse,
+    artefact_records: list[dict] | None = None,
 ) -> str:
     """Format a SubagentResponse as the TOOL-message body the LLM reads.
 
     The status word is at the start so the LLM can branch on it quickly.
     For ``input-required`` we tell the model exactly what to do — call
-    consult_<name> again with the same session_id.
+    consult_<name> again with the same session_id. Persisted artefact
+    paths are surfaced inline so the LLM can ``read`` them immediately.
     """
     parts = [f"[{response.status}]"]
     if response.session_id:
         parts.append(f"session_id={response.session_id}")
     parts.append(response.content or "")
     body = " ".join(p for p in parts if p)
+    if artefact_records:
+        bullet_lines = [
+            f"- `{a['path']}` — {a['name']}"
+            + (f" ({a['mime']})" if a.get("mime") else "")
+            + (f" — {a['description']}" if a.get("description") else "")
+            for a in artefact_records
+        ]
+        body += (
+            "\n\nArtefacts written to the project namespace:\n"
+            + "\n".join(bullet_lines)
+            + "\nUse `read` on any of the paths above to inspect them."
+        )
     if response.status == "input-required":
         body += (
             f"\n\nTo continue, call `consult_{subagent_name}` again with "
             f"`session_id=\"{response.session_id}\"` and your reply as `message`."
         )
     return body
+
+
+# --------------------------------------------------------------------------- #
+# Subagent artefact persistence                                                #
+# --------------------------------------------------------------------------- #
+
+_ARTEFACT_DIR = "artefacts"
+_SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _persist_artefacts(
+    namespace: NamespaceAdapter,
+    project_id: str,
+    artefacts: list[Artefact],
+) -> list[dict]:
+    """Write each artefact to the project namespace.
+
+    Paths are content-addressable: ``<project>/artefacts/<sha[:8]>__<name>``.
+    This decouples the path from the event offset (so CAS retries don't
+    relocate files) while keeping the name human-readable. Identical
+    bytes dedupe naturally.
+
+    Returns one record per artefact: ``{path, name, size, mime, sha256,
+    description}``. The runtime threads these into the consult event and
+    the TOOL response.
+    """
+    records: list[dict] = []
+    for art in artefacts:
+        sha = hashlib.sha256(art.content).hexdigest()
+        safe_name = _sanitise_artefact_name(art.name)
+        path = f"{project_id}/{_ARTEFACT_DIR}/{sha[:8]}__{safe_name}"
+        # write_binary may raise NotImplementedError on text-only adapters
+        # — that's a legitimate operator error; surface it rather than
+        # silently dropping the artefact.
+        namespace.write_binary(path, art.content)
+        mime = art.mime
+        if mime is None:
+            info = namespace.doc_info(path)
+            mime = info.mime if info is not None else None
+        records.append({
+            "path": path,
+            "name": art.name,
+            "size": len(art.content),
+            "mime": mime,
+            "sha256": sha,
+            "description": art.description,
+        })
+    return records
+
+
+def _sanitise_artefact_name(name: str) -> str:
+    """Replace path-unsafe characters with ``_`` while keeping the extension.
+
+    Trims to a sane length so the path stays well below filesystem limits
+    on the various namespace backends we plan to support (S3, SharePoint).
+    """
+    cleaned = _SANITISE_RE.sub("_", name).strip("._")
+    if not cleaned:
+        cleaned = "artefact.bin"
+    if len(cleaned) > 80:
+        # Keep the extension; truncate the stem.
+        if "." in cleaned:
+            stem, _, ext = cleaned.rpartition(".")
+            cleaned = stem[: 80 - len(ext) - 1] + "." + ext
+        else:
+            cleaned = cleaned[:80]
+    return cleaned
 
 
 def _truncate_for_log(text: str, max_len: int = 80) -> str:

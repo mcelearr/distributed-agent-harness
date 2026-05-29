@@ -354,7 +354,7 @@ Each item below is intentionally self-contained — file paths, class names, acc
 | 2 | A2A subagent support with pluggable agent registries | Done | (4) landed as part of this work |
 | 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Done | (1) should land first so the predicate name in the new event-projection flow is stable |
 | 4 | `search_event_log` — built-in queryable view over the project event log | Done | (3) |
-| 5 | In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`) | Planned | (6, 7) |
+| 5 | In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`) | Done | (6, 7) |
 | 6 | Filesystem-style navigation meta-tools (`ls` / `read` / `grep`) | Done | — |
 | 7 | Binary documents in `NamespaceAdapter` (`read_binary` / `write_binary`) | Done | (6) |
 
@@ -711,7 +711,7 @@ Decide one of:
 
 ### 5. In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`)
 
-**Status:** planned (depends on 6 + 7)
+**Status:** done
 
 **Goal:** register subagents that run *inside the harness* — on the same event loop, or behind a project-bus topic — without an HTTP+SSE boundary. The LLM-facing interface is the same `consult_<name>(message, session_id)` from task 2; only the transport differs.
 

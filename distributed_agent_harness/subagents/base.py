@@ -50,6 +50,39 @@ class AgentCard:
 
 
 # --------------------------------------------------------------------------- #
+# Artefact                                                                     #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Artefact:
+    """One binary deliverable produced by a subagent.
+
+    Subagents return artefacts inside their ``SubagentResponse``; the
+    runtime is responsible for writing them into the project namespace at
+    a content-addressable path (``<project>/artefacts/<sha256[:8]>__<name>``).
+    The agent then finds them via the ``ls`` / ``read`` meta-tools.
+
+    Fields
+    ------
+    name:
+        Human-readable filename. Used to derive the namespace path. The
+        runtime sanitises it before use.
+    content:
+        Raw bytes. May be empty.
+    mime:
+        Optional explicit MIME type. When omitted the runtime falls back
+        to a guess from the extension.
+    description:
+        One-line, human-readable description recorded with the consult
+        event (e.g. "draft of breach response, version 1").
+    """
+    name: str
+    content: bytes
+    mime: str | None = None
+    description: str = ""
+
+
+# --------------------------------------------------------------------------- #
 # Response shapes                                                              #
 # --------------------------------------------------------------------------- #
 
@@ -68,11 +101,17 @@ class SubagentResponse:
       (typically the LLM) decides whether to follow up with another
       ``consult`` using the same ``session_id`` or abandon.
     - ``failed`` — the subagent errored; ``content`` is the reason.
+
+    In-process subagents may also return ``artefacts`` — binary
+    deliverables that the runtime writes into the project namespace and
+    records on the consult event so the agent can find them later via
+    ``ls`` / ``read``.
     """
     status: SubagentStatus
     content: str
     session_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    artefacts: list[Artefact] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #

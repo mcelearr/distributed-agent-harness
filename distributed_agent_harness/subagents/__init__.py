@@ -3,11 +3,22 @@
 from .a2a import A2ASubagent
 from .base import (
     AgentCard,
+    Artefact,
     Skill,
     SubagentClient,
     SubagentRegistry,
     SubagentResponse,
     SubagentTimeout,
+)
+from .inprocess import (
+    AsyncSubagent,
+    InMemoryMessageBus,
+    InProcessSubagent,
+    MessageBus,
+    MessagingSubagent,
+    MessagingSubagentWorker,
+    NoSubscriberError,
+    Subscription,
 )
 from .registry import (
     AgentRegistry,
@@ -18,6 +29,7 @@ from .registry import (
 
 __all__ = [
     "AgentCard",
+    "Artefact",
     "Skill",
     "SubagentClient",
     "SubagentRegistry",
@@ -28,4 +40,13 @@ __all__ = [
     "StaticAgentRegistry",
     "HttpAgentRegistry",
     "load_subagents_from_registry",
+    # In-process subagents
+    "InProcessSubagent",
+    "AsyncSubagent",
+    "MessageBus",
+    "InMemoryMessageBus",
+    "MessagingSubagent",
+    "MessagingSubagentWorker",
+    "NoSubscriberError",
+    "Subscription",
 ]
