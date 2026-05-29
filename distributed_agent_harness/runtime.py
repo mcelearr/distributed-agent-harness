@@ -38,15 +38,33 @@ from .eventlog import Appended, Event, EventLog
 from .hooks import ActionContext, BlockDecision, HookRegistry, SubagentContext
 from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
 from .namespace import NamespaceAdapter
+from .namespace_browse import (
+    DEFAULT_GREP_LIMIT,
+    DEFAULT_READ_LIMIT,
+    grep_docs,
+    list_dir,
+    read_doc,
+    render_grep,
+    render_ls,
+    render_read,
+)
 from .prompt_builder import PromptBuilder
 from .subagents import SubagentRegistry, SubagentResponse, SubagentTimeout
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
 from .world import ActionNotAvailable, BaseWorldEnvironment
 
 
-# Reserved built-in tool names (cannot be used as @action names without clash)
+# Reserved built-in tool names. Any @action whose name collides with one of
+# these would be shadowed by the meta-tool dispatch — fail fast at runtime
+# construction rather than silently swallowing user actions.
 _SEARCH_EVENT_LOG_TOOL = "search_event_log"
+_LS_TOOL = "ls"
+_READ_TOOL = "read"
+_GREP_TOOL = "grep"
 _SUBAGENT_TOOL_PREFIX = "consult_"
+_RESERVED_TOOL_NAMES = frozenset({
+    _SEARCH_EVENT_LOG_TOOL, _LS_TOOL, _READ_TOOL, _GREP_TOOL,
+})
 
 log = logging.getLogger(__name__)
 
@@ -109,6 +127,24 @@ class AgentRuntime:
         hooks: HookRegistry | None = None,
         conflict_resolver: ConflictResolver | None = None,
     ) -> None:
+        # Fail fast on @action names that would be shadowed by built-in
+        # meta-tools (search_event_log, ls, read, grep) or by the
+        # consult_<name> subagent prefix.
+        action_names = set(world_class.get_actions().keys())
+        clashes = action_names & _RESERVED_TOOL_NAMES
+        if clashes:
+            raise ValueError(
+                f"@action name(s) collide with built-in meta-tools: "
+                f"{sorted(clashes)}. Reserved names are: "
+                f"{sorted(_RESERVED_TOOL_NAMES)}."
+            )
+        prefix_clashes = {n for n in action_names if n.startswith(_SUBAGENT_TOOL_PREFIX)}
+        if prefix_clashes:
+            raise ValueError(
+                f"@action name(s) start with reserved subagent prefix "
+                f"{_SUBAGENT_TOOL_PREFIX!r}: {sorted(prefix_clashes)}."
+            )
+
         self.world_class = world_class
         self.namespace = namespace
         self.eventlog = eventlog
@@ -360,6 +396,14 @@ class AgentRuntime:
         # ----- meta-tool: search_event_log
         if call.name == _SEARCH_EVENT_LOG_TOOL:
             return await self._execute_search_event_log(call, world, reply_to)
+
+        # ----- meta-tools: namespace navigation (ls / read / grep)
+        if call.name == _LS_TOOL:
+            return await self._execute_ls(call, reply_to)
+        if call.name == _READ_TOOL:
+            return await self._execute_read(call, reply_to)
+        if call.name == _GREP_TOOL:
+            return await self._execute_grep(call, reply_to)
 
         # ----- subagent: consult_<name>
         if call.name.startswith(_SUBAGENT_TOOL_PREFIX):
@@ -820,6 +864,79 @@ class AgentRuntime:
         )
 
     # ----------------------------------------------------------------------- #
+    # Tool dispatch — filesystem-style navigation (ls / read / grep)           #
+    # ----------------------------------------------------------------------- #
+    #
+    # These mirror Claude Code's / PI's baseline read tools so the agent can
+    # browse the project namespace as a virtual filesystem. They are
+    # read-only — no event appended, no hook fired. Writes still go through
+    # ``@actions``.
+
+    async def _execute_ls(self, call: ToolCall, reply_to: Any) -> Message:
+        args = call.arguments or {}
+        path = str(args.get("path", "") or "")
+        entries = list_dir(self.namespace, path)
+        result_text = render_ls(entries)
+        return await self._meta_tool_response(call, reply_to, result_text)
+
+    async def _execute_read(self, call: ToolCall, reply_to: Any) -> Message:
+        args = call.arguments or {}
+        path = args.get("path")
+        if not isinstance(path, str) or not path:
+            return await self._meta_tool_response(
+                call, reply_to,
+                "Invalid arguments for read: 'path' is required",
+                is_error=True,
+            )
+        offset = _coerce_optional_int(args.get("offset"))
+        limit = _coerce_optional_int(args.get("limit"))
+        content, meta = read_doc(self.namespace, path, offset=offset, limit=limit)
+        result_text = render_read(content, path, meta)
+        return await self._meta_tool_response(call, reply_to, result_text)
+
+    async def _execute_grep(self, call: ToolCall, reply_to: Any) -> Message:
+        args = call.arguments or {}
+        pattern = args.get("pattern")
+        if not isinstance(pattern, str) or not pattern:
+            return await self._meta_tool_response(
+                call, reply_to,
+                "Invalid arguments for grep: 'pattern' is required",
+                is_error=True,
+            )
+        path = str(args.get("path", "") or "")
+        glob = args.get("glob")
+        glob = glob if isinstance(glob, str) and glob else None
+        ignore_case = bool(args.get("ignore_case", False))
+        limit = _coerce_optional_int(args.get("limit")) or DEFAULT_GREP_LIMIT
+        matches = grep_docs(
+            self.namespace, pattern,
+            path=path, glob=glob, ignore_case=ignore_case, limit=limit,
+        )
+        result_text = render_grep(matches, limit=limit)
+        return await self._meta_tool_response(call, reply_to, result_text)
+
+    async def _meta_tool_response(
+        self,
+        call: ToolCall,
+        reply_to: Any,
+        result_text: str,
+        is_error: bool = False,
+    ) -> Message:
+        """Shared envelope for read-only meta-tools."""
+        if reply_to:
+            payload: dict[str, Any] = {"name": call.name, "id": call.id}
+            payload["error" if is_error else "result"] = result_text
+            await reply_to.emit(OutputEvent(
+                kind=OutputEventKind.ACTION_RESULT, payload=payload,
+            ))
+        return Message(
+            role=Role.TOOL,
+            content=result_text,
+            tool_call_id=call.id,
+            name=call.name,
+        )
+
+    # ----------------------------------------------------------------------- #
     # Per-turn tool schema assembly                                            #
     # ----------------------------------------------------------------------- #
 
@@ -834,11 +951,15 @@ class AgentRuntime:
         - all ``@action`` schemas whose ``show_when`` matches current state
         - one ``consult_<name>`` schema per registered subagent whose
           ``show_when`` matches
-        - the built-in ``search_event_log`` meta-tool
+        - the always-on built-in meta-tools: ``ls``, ``read``, ``grep``,
+          ``search_event_log``
         """
         visible_actions = _visible_action_names(self.world_class, world.state, event)
         schemas = [s for s in self._action_tool_schemas if s.name in visible_actions]
         schemas.extend(_subagent_tool_schemas(self.subagents, world.state, event))
+        schemas.append(_ls_tool_schema())
+        schemas.append(_read_tool_schema())
+        schemas.append(_grep_tool_schema())
         schemas.append(_search_event_log_tool_schema())
         return schemas
 
@@ -1046,6 +1167,133 @@ def _search_event_log_tool_schema() -> ToolSchema:
             "required": [],
         },
     )
+
+
+# --------------------------------------------------------------------------- #
+# Namespace navigation tool schemas (ls / read / grep)                         #
+# --------------------------------------------------------------------------- #
+
+def _ls_tool_schema() -> ToolSchema:
+    return ToolSchema(
+        name=_LS_TOOL,
+        description=(
+            "List entries under a path in the project namespace. The "
+            "namespace is the agent's virtual filesystem: project state, "
+            "logs, subagent artefacts. Returns names with a '/' suffix for "
+            "subdirectories. Use this to discover documents that are not "
+            "already lifted into the system prompt."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Path prefix to list. Use the project id (e.g. "
+                        "'demo/') to see the top of the project, or a "
+                        "subdirectory like 'demo/artefacts/'. Defaults to "
+                        "the namespace root."
+                    ),
+                },
+            },
+            "required": [],
+        },
+    )
+
+
+def _read_tool_schema() -> ToolSchema:
+    return ToolSchema(
+        name=_READ_TOOL,
+        description=(
+            "Read a text document from the project namespace. Use this to "
+            "open documents found via `ls` or `grep` that are not lifted "
+            "into the system prompt — e.g. the full `event_log.md`, the "
+            "raw `audit.jsonl`, or any artefact dropped under "
+            "<project>/artefacts/. Reading does not change project state."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Full path of the document.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": (
+                        "1-indexed starting line. Use with `limit` to "
+                        "paginate large documents."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        f"Maximum lines to return. Defaults to "
+                        f"{DEFAULT_READ_LIMIT}; the response indicates "
+                        "whether content was truncated and how to continue."
+                    ),
+                },
+            },
+            "required": ["path"],
+        },
+    )
+
+
+def _grep_tool_schema() -> ToolSchema:
+    return ToolSchema(
+        name=_GREP_TOOL,
+        description=(
+            "Search document content across the project namespace. The "
+            "pattern is a Python regex (a bad pattern falls back to literal "
+            "substring search). Use this to find references — names, IDs, "
+            "specific topics — across all project documents."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex (or literal substring) to search for.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "Restrict the search to documents whose path starts "
+                        "with this prefix. Defaults to the namespace root."
+                    ),
+                },
+                "glob": {
+                    "type": "string",
+                    "description": (
+                        "Optional fnmatch glob over full document paths "
+                        "(e.g. '*.md', '*/artefacts/*')."
+                    ),
+                },
+                "ignore_case": {
+                    "type": "boolean",
+                    "description": "Case-insensitive match. Default False.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": (
+                        f"Maximum number of matches. Default "
+                        f"{DEFAULT_GREP_LIMIT}."
+                    ),
+                },
+            },
+            "required": ["pattern"],
+        },
+    )
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    """Coerce LLM-supplied numeric kwargs into ``int | None`` defensively."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # --------------------------------------------------------------------------- #

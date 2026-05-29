@@ -13,6 +13,16 @@ from .conflict import (
     ScriptedResolver,
 )
 from .event_search import EventQuery, render_events_markdown, search_events
+from .namespace_browse import (
+    DirEntry,
+    GrepMatch,
+    grep_docs,
+    list_dir,
+    read_doc,
+    render_grep,
+    render_ls,
+    render_read,
+)
 from .eventlog import (
     Appended,
     AppendResult,
@@ -124,6 +134,15 @@ __all__ = [
     "EventQuery",
     "search_events",
     "render_events_markdown",
+    # Namespace browsing
+    "DirEntry",
+    "GrepMatch",
+    "list_dir",
+    "read_doc",
+    "grep_docs",
+    "render_ls",
+    "render_read",
+    "render_grep",
     # Subagents
     "SubagentClient",
     "SubagentResponse",

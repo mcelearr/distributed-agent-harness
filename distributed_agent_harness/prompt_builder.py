@@ -183,6 +183,29 @@ class PromptBuilder:
             "`action_name_glob='consult_*'`."
         )
 
+    def build_namespace_browse_prompt(self) -> str:
+        """Return the always-on "Exploring the Namespace" section.
+
+        Tells the LLM the project namespace is a virtual filesystem and the
+        three baseline read tools exist (``ls`` / ``read`` / ``grep``).
+        """
+        return (
+            "## Exploring the Namespace\n\n"
+            "The project namespace is the agent's virtual filesystem. The "
+            "Project Summary and Current State above are lifted excerpts; "
+            "the full set of documents — `event_log.md`, `audit.jsonl`, "
+            "subagent artefacts under `<project>/artefacts/`, and anything "
+            "else stored under the project — is accessible through three "
+            "read-only meta-tools:\n\n"
+            "- `ls(path)` — list documents and subdirectories at a path.\n"
+            "- `read(path, offset?, limit?)` — read a text document.\n"
+            "- `grep(pattern, path?, glob?, ignore_case?)` — search content "
+            "across documents.\n\n"
+            "These tools do not change project state. To change state, call "
+            "an `@action`. To consult an external specialist, use one of "
+            "the `consult_<name>` subagent tools."
+        )
+
     def build_full_prompt(
         self,
         world: "BaseWorldEnvironment",
@@ -209,6 +232,7 @@ class PromptBuilder:
         if subagents_section is not None:
             sections.append(subagents_section)
         sections.extend([
+            self.build_namespace_browse_prompt(),
             self.build_search_event_log_prompt(),
             self.build_recent_activity_prompt(world),
             self.build_state_prompt(world),

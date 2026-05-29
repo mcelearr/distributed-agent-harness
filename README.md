@@ -354,7 +354,9 @@ Each item below is intentionally self-contained — file paths, class names, acc
 | 2 | A2A subagent support with pluggable agent registries | Done | (4) landed as part of this work |
 | 3 | Drop `InProcessLock`; go all-in on event sourcing + agent-as-rebaser conflict resolution | Done | (1) should land first so the predicate name in the new event-projection flow is stable |
 | 4 | `search_event_log` — built-in queryable view over the project event log | Done | (3) |
-| 5 | In-process subagent ABC (asyncio / subprocess / messaging variants) | Planned | (2) |
+| 5 | In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`) | Planned | (6, 7) |
+| 6 | Filesystem-style navigation meta-tools (`ls` / `read` / `grep`) | Done | — |
+| 7 | Binary documents in `NamespaceAdapter` (`read_binary` / `write_binary`) | Planned | (6) |
 
 ---
 
@@ -707,36 +709,114 @@ Decide one of:
 
 ---
 
-### 5. In-process subagent ABC (asyncio / subprocess / messaging variants)
+### 5. In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`)
 
-**Status:** planned
+**Status:** planned (depends on 6 + 7)
 
-**Goal:** register subagents that run *inside the harness* — on the same event loop, in a subprocess, or behind a project-bus topic — without going through an HTTP+SSE boundary. The LLM-facing interface is the same `consult_<name>(message, session_id)` tool surfaced by task 2; only the transport differs.
+**Goal:** register subagents that run *inside the harness* — on the same event loop, or behind a project-bus topic — without an HTTP+SSE boundary. The LLM-facing interface is the same `consult_<name>(message, session_id)` from task 2; only the transport differs.
 
-**Why:** some specialists are too tightly coupled to the project to deserve their own service (e.g. a structured-output classifier that needs to read project state, a batch document chunker, a domain-specific summariser). Spinning up a separate process per role is overkill; embedding them as `@actions` blurs the action vocabulary.
+**Why:** some specialists belong inside the harness (a structured-output classifier that reads project state, a domain-specific summariser, a PDF generator). Spinning up a separate HTTP service per role is overkill; embedding them as `@actions` blurs the action vocabulary.
+
+**Decisions captured before implementation:**
+
+- **No subprocess variant.** Dropped from the original sketch; the asyncio + messaging variants cover the realistic cases.
+- **Spawn-per-call**, no worker pool, no concurrency cap. Each `consult()` creates a fresh task / publishes a fresh correlated request.
+- **No hard Kafka dependency.** `MessagingSubagent` takes a `MessageBus` ABC. Ships with `InMemoryMessageBus` (asyncio queues) for tests and local dev; the Kafka backend lands alongside the Kafka event log.
+- **No subagent state mutation.** Subagents do not call `@actions` directly. Anything an in-process subagent wants to persist comes back in its `SubagentResponse` and is written by the runtime — to the event log (the consult event itself) and/or to the project namespace (artefacts).
+- **Artefacts under the namespace.** A subagent's `SubagentResponse` may include `artefacts: list[Artefact]` (name, bytes, mime, description). The runtime writes each at `<project>/artefacts/<offset>__<sanitised_name>.<ext>` via the binary methods landed in task 7. The consult event records `{name, path, size, sha256, description}`. The agent finds the artefact later via the `ls` / `read` meta-tools (task 6). No git-style versioning; the event log is the version history.
 
 **Module `distributed_agent_harness/subagents/inprocess/` (new):**
 
-- `class InProcessSubagent(SubagentClient)` — abstract base; subclasses choose the execution model.
-- `class AsyncSubagent(InProcessSubagent)` — `consult()` runs an async function on the same loop.
-- `class ProcessSubagent(InProcessSubagent)` — spawns a subprocess (isolation, can carry its own dependencies); pipes the message in, reads the response out.
-- `class MessagingSubagent(InProcessSubagent)` — publishes the request to the project's message bus (same Kafka the event log uses) and consumes the response from a per-call response topic.
-
-**Conversation history (key difference from A2A subagents):**
-
-- Unlike A2A subagents, in-process subagents store their conversation **under the project namespace**, at `<project>/subagents/<name>/conversation.jsonl` (one message per line).
-- The harness owns this directory; the subagent reads/writes via the project's `NamespaceAdapter`. Same multi-backend story applies (S3, SharePoint, etc.).
-- `session_id` for in-process subagents is the path itself (or a hash of it) — round-trips through the TOOL response exactly like A2A subagents, so the LLM's interface is uniform.
+- `class InProcessSubagent(SubagentClient)` — abstract base; subclasses choose execution.
+- `class AsyncSubagent(InProcessSubagent)` — wraps an async function on the same loop. Spawn-per-call.
+- `class MessagingSubagent(InProcessSubagent)` — publishes a correlated request on a `MessageBus` and awaits the response. Spawn-per-call.
+- `class MessageBus(ABC)` — `publish(topic, message, correlation_id)`, `request(topic, message, timeout)`, `subscribe(topic, handler)`. Shipped impl: `InMemoryMessageBus` (asyncio queues per topic; UUID correlation). Planned: `KafkaMessageBus` alongside the Kafka event log.
+- `class MessagingSubagentWorker` — helper that wraps an async function as a subscriber on the request topic. Lets a complete in-process loop run without external infra during tests.
 
 **Acceptance criteria:**
 
-- Three working subclasses: `AsyncSubagent`, `ProcessSubagent`, `MessagingSubagent`.
+- Two working subclasses: `AsyncSubagent`, `MessagingSubagent`.
 - A registered in-process subagent appears in the prompt and is callable identically to an A2A subagent.
-- Its conversation persists under `<project>/subagents/<name>/conversation.jsonl` across runs.
-- The runtime treats it as a subagent for hooks (`pre_subagent_call` / `post_subagent_call`), not as an action.
+- Subagent-produced artefacts land under `<project>/artefacts/` and are visible via `ls` / `read`.
+- The runtime treats them as subagents for hooks (`pre_subagent_call` / `post_subagent_call`), not as actions.
+- The codebase has no Kafka import in the subagent layer; `MessagingSubagent` works against `InMemoryMessageBus` out of the box.
 
-**Open questions:**
+---
 
-- Should `AsyncSubagent` get its own conflict-resolution semantics if it mutates project state, or stay strictly read-only?
-- Lifecycle of subprocess subagents — spawn-per-call vs persistent worker pool.
-- For `MessagingSubagent`, define the request/response envelope on the Kafka topic.
+### 6. Filesystem-style navigation meta-tools (`ls` / `read` / `grep`)
+
+**Status:** done
+
+**Goal:** give the agent the *read* side of the filesystem-as-world pattern that harnesses like Claude Code and PI use. The agent must be able to browse the project namespace just like any other agent harness — list directories, read documents, grep for content — without us having to lift every interesting document into the system prompt. **All writes still go through `@actions`.** This is the read side only.
+
+**Why:** the harness currently only exposes documents we explicitly lift into the prompt (Summary, State, Recent Activity). Anything else — artefacts from subagents, longer documents, historical notes — is invisible to the LLM. Adding three baseline read-only meta-tools (next to `search_event_log`) closes that gap without breaking the auditable-writes contract: reads don't change state, so they don't need auditing.
+
+**Tools added** (always-on, no registration needed):
+
+| Tool | Signature | Behaviour |
+|---|---|---|
+| `ls` | `ls(path: str = "") -> str` | List entries under a namespace prefix. Returns names with `/` suffix for "directories" (synthesised from common prefixes). |
+| `read` | `read(path: str, offset: int = None, limit: int = None) -> str` | Read a text document. Optional 1-indexed line offset and limit, mirroring PI's `read`. |
+| `grep` | `grep(pattern: str, path: str = "", glob: str = None, ignore_case: bool = False, limit: int = 100) -> str` | Substring/regex search across docs matching `path` prefix + optional `glob`. |
+
+**New module `distributed_agent_harness/namespace_browse.py`:**
+
+- `@dataclass DirEntry`: `name`, `kind: Literal["file", "directory"]`, `size: int | None`.
+- `@dataclass GrepMatch`: `path`, `line_number: int`, `line: str`.
+- `def list_dir(adapter, path) -> list[DirEntry]` — derive directory semantics from common path prefixes in `list_docs()` results.
+- `def read_doc(adapter, path, offset=None, limit=None) -> str | None` — 1-indexed line offset, optional limit; truncation notice when limit cuts content.
+- `def grep_docs(adapter, pattern, path="", glob=None, ignore_case=False, limit=100) -> list[GrepMatch]`.
+- Pure rendering helpers (`render_ls`, `render_grep`) for the runtime / CLI / other agents.
+
+**Runtime integration:**
+
+- Tool schemas appended in `_tool_schemas_for_turn` alongside `search_event_log`.
+- Dispatch in `_execute_call`: read-only, no event append, no hook fires (same pattern as `search_event_log`).
+- Reserved-name check at runtime construction: if any `@action` has name `ls`, `read`, `grep`, or `search_event_log`, raise immediately.
+- New prompt section "Exploring the Namespace" alongside "Searching the Event Log", reminding the LLM that browsing tools exist.
+
+**Acceptance criteria:**
+
+- The four reserved names (`ls`, `read`, `grep`, `search_event_log`) appear in every runtime's tool schemas with no registration.
+- The LLM can `ls demo/`, see the standard docs + any subdirectories, then `read demo/event_log.md` for the full file.
+- `grep("Acme", path="demo/")` finds matches across all docs under the prefix.
+- Calling any of these does NOT append to the event log.
+- A test confirms `@action(name="read")` raises at runtime construction.
+
+---
+
+### 7. Binary documents in `NamespaceAdapter`
+
+**Status:** planned (depends on 6)
+
+**Goal:** the namespace is currently text-only. Subagents (and humans) routinely produce binary artefacts — PDFs, images, spreadsheets — that need to live somewhere accessible to the LLM. Extend `NamespaceAdapter` with optional binary methods so artefacts get first-class storage alongside text docs.
+
+**Why:** without this, a subagent's PDF either has to live outside the project (lifecycle drift, no replay guarantee) or be base64-encoded into the event log (which we explicitly ruled out as unscalable). Binary docs under the namespace adapter let artefacts travel with the project across backends (in-memory → S3 → SharePoint) and stay browseable via the `ls` / `read` meta-tools.
+
+**`NamespaceAdapter` interface change:**
+
+```python
+class NamespaceAdapter:
+    # existing
+    def read_doc(self, path: str) -> str | None: ...
+    def write_doc(self, path: str, content: str) -> None: ...
+    def list_docs(self, prefix: str = "") -> list[str]: ...
+
+    # new (optional — defaults raise NotImplementedError)
+    def read_binary(self, path: str) -> bytes | None: ...
+    def write_binary(self, path: str, content: bytes) -> None: ...
+    def doc_info(self, path: str) -> DocInfo | None: ...  # size, mime, mtime
+```
+
+The `read` meta-tool (task 6) auto-detects binary by extension (`.pdf`, `.png`, `.jpg`, `.docx`, …) and routes through `read_binary`. For LLMs that support image input, image bytes are returned as a base64 attachment alongside a text descriptor — same shape PI uses. For PDFs and other non-image binaries, the LLM gets a descriptor with size + mime + first-N-bytes hex preview; opening them properly is a future per-mime extractor.
+
+**`InMemoryNamespace` changes:**
+
+- Internal store becomes `dict[str, bytes | str]` (preserves text reads/writes unchanged; adds binary alongside).
+- `read_binary` returns the bytes; `read_doc` returns the text or raises if you call it on binary.
+
+**Acceptance criteria:**
+
+- `read_binary` / `write_binary` round-trip arbitrary bytes through `InMemoryNamespace`.
+- `read` meta-tool reading `demo/artefacts/foo.pdf` returns a PDF descriptor (size, mime, sha256); reading `demo/artefacts/bar.png` returns image content the LLM can see.
+- All existing tests pass — text docs continue to work exactly as before.
