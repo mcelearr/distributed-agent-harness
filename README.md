@@ -357,6 +357,8 @@ Each item below is intentionally self-contained — file paths, class names, acc
 | 5 | In-process subagent ABC (`AsyncSubagent`, `MessagingSubagent`) | Done | (6, 7) |
 | 6 | Filesystem-style navigation meta-tools (`ls` / `read` / `grep`) | Done | — |
 | 7 | Binary documents in `NamespaceAdapter` (`read_binary` / `write_binary`) | Done | (6) |
+| 8 | `KafkaEventLog` — production backend for the event log | Planned | (3) |
+| 9 | `KafkaMessageBus` — production backend for `MessagingSubagent` | Planned | (5) |
 
 ---
 
@@ -820,3 +822,62 @@ The `read` meta-tool (task 6) auto-detects binary by extension (`.pdf`, `.png`, 
 - `read_binary` / `write_binary` round-trip arbitrary bytes through `InMemoryNamespace`.
 - `read` meta-tool reading `demo/artefacts/foo.pdf` returns a PDF descriptor (size, mime, sha256); reading `demo/artefacts/bar.png` returns image content the LLM can see.
 - All existing tests pass — text docs continue to work exactly as before.
+
+---
+
+### 8. `KafkaEventLog` — production backend for the event log
+
+**Status:** planned
+
+**Goal:** ship the production-grade backend that pairs with task 3's `InMemoryEventLog`. A real distributed deployment needs an event log that survives process restarts and lets multiple harness instances see the same ordered stream per project.
+
+**Decisions captured before implementation:**
+
+- **Client library**: `aiokafka` (decision locked in during task 3). Pure async, no `librdkafka` system dependency, slots into the existing async runtime. Adds one dep to the optional `kafka` extra so the in-memory backend remains zero-deps.
+- **Topic layout**: one topic for events, partition key = `project_id`. Each project is a totally ordered partition; cross-project ordering is not promised (and not needed).
+- **Optimistic CAS**: implemented via the producer's transactional API + a per-project offset cache. Producer reads `current_offset` from its consumer view; transactional append fails if the partition has advanced. Loser sees `Conflict` with `intervening_events`, matching the in-memory contract.
+- **Snapshot path stays the same**: `<project>/state.json` with `_meta.last_offset`. The namespace adapter is independent of the event log backend; switching to Kafka changes only `EventLog`.
+- **Replay**: hydrating a project after a process restart means reading from `partition[0]` up to `last_offset` in `state.json` (snapshot is authoritative) — unchanged from the in-memory contract.
+- **Local dev**: a Docker Compose snippet shipped under `examples/kafka/` brings up a single-node Kafka so the in-memory and Kafka paths can be exercised side-by-side without infrastructure setup.
+
+**Module `distributed_agent_harness/eventlogs/kafka_eventlog.py` (new):**
+
+- `class KafkaEventLog(EventLog)` — implements `current_offset`, `append`, `read_events` over a partitioned topic.
+- Internal `aiokafka.AIOKafkaProducer` (transactional) + `aiokafka.AIOKafkaConsumer` for the per-project read path. The consumer seeks by offset on demand.
+- Event serialisation: JSON. Each record's key = `project_id`, value = the serialised `Event`. Offsets are partition offsets exposed unchanged.
+
+**Acceptance criteria:**
+
+- `pip install distributed-agent-harness[kafka]` brings in `aiokafka`; the base install does not.
+- All existing `InMemoryEventLog` tests pass when re-parameterised against `KafkaEventLog` connected to a docker-compose-managed local broker.
+- A new integration test runs two harness processes against the same Kafka cluster on the same `project_id`; one wins the CAS, the other surfaces `Conflict` with the intervening event — same flow as the in-memory test.
+- `examples/kafka/docker-compose.yml` brings up the broker; a one-line `make kafka-up` (or equivalent) is documented.
+
+---
+
+### 9. `KafkaMessageBus` — production backend for `MessagingSubagent`
+
+**Status:** planned (depends on 5; the in-memory and Kafka buses share the `MessageBus` ABC from task 5)
+
+**Goal:** sibling to task 8 — the production-grade backend for `MessagingSubagent`. The `MessageBus` ABC was deliberately left transport-agnostic so this lands without touching the subagent layer.
+
+**Decisions captured before implementation:**
+
+- **Client library**: `aiokafka` (same as task 8; share connection-pool patterns and Docker Compose setup).
+- **Topic layout per subagent**: one request topic per registered worker, plus one shared response topic with messages routed by `__correlation_id__`. (Per-call response topics are simpler but generate too many topics in production; correlation-id routing is the standard pattern.)
+- **At-least-once delivery, idempotent handlers**: workers may see duplicate messages on rebalance. Handlers must be idempotent or store-and-dedupe by `__correlation_id__`. Documented as a contract on `MessagingSubagentWorker`.
+- **No streaming progress**: the v1 protocol carries one request → one response. Streaming `working` deltas over Kafka is a future enhancement (would need a per-call progress topic).
+- **Local dev**: shares the docker-compose broker introduced for task 8.
+
+**Module `distributed_agent_harness/subagents/inprocess/kafka_bus.py` (new):**
+
+- `class KafkaMessageBus(MessageBus)` — implements `request`, `subscribe`, `_on_unsubscribe`.
+- Internal `aiokafka.AIOKafkaProducer` + one `aiokafka.AIOKafkaConsumer` per subscribed topic; correlation-id-keyed response routing on the shared reply topic.
+- Reuses `NoSubscriberError` and `Subscription` from the in-memory bus; the public API is identical.
+
+**Acceptance criteria:**
+
+- `pip install distributed-agent-harness[kafka]` is sufficient (same extra as task 8).
+- The full `MessagingSubagent` + `MessagingSubagentWorker` round-trip test from task 5 passes when re-parameterised against `KafkaMessageBus`.
+- An integration test starts a worker against the broker, a client elsewhere consults the topic, the response routes back by correlation id.
+- The codebase has no Kafka import outside the two new modules and the `[kafka]` extra in `pyproject.toml`.

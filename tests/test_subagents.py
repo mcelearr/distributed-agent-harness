@@ -4,6 +4,7 @@ Tests for the subagent layer:
 - A2ASubagent against an in-memory SSE server using ``httpx.MockTransport``
 - SubagentRegistry registration / lookup
 - StaticAgentRegistry filtering by query / tags
+- HttpAgentRegistry against a mocked corporate registry HTTP service
 - ``load_subagents_from_registry`` end-to-end
 - Auth resolution (dict and callable forms)
 - SubagentTimeout when the SSE stream stalls
@@ -20,6 +21,7 @@ import pytest
 from distributed_agent_harness.subagents import (
     A2ASubagent,
     AgentCard,
+    HttpAgentRegistry,
     Skill,
     StaticAgentRegistry,
     SubagentRegistry,
@@ -326,3 +328,246 @@ class TestSubagentTimeout:
         with pytest.raises(SubagentTimeout):
             await agent.consult(message="hi", timeout=0.2)
         await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# HttpAgentRegistry                                                            #
+# --------------------------------------------------------------------------- #
+
+def _registry_transport(
+    *,
+    list_response: dict | list | None = None,
+    get_responses: dict[str, dict] | None = None,
+    capture: list[httpx.Request] | None = None,
+) -> httpx.MockTransport:
+    """A MockTransport that emulates a tiny corporate agent registry service.
+
+    Routes:
+    - ``GET /agents`` → JSON ``list_response`` (defaults to empty list)
+    - ``GET /agents/{name}`` → JSON ``get_responses[name]``
+    """
+    list_response = list_response if list_response is not None else {"agents": []}
+    get_responses = get_responses or {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if capture is not None:
+            capture.append(request)
+        path = request.url.path
+        if path.endswith("/agents"):
+            return httpx.Response(200, json=list_response)
+        if "/agents/" in path:
+            name = path.rsplit("/", 1)[-1]
+            if name in get_responses:
+                return httpx.Response(200, json=get_responses[name])
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(_handler)
+
+
+def _registry_card_json(name: str, **overrides: Any) -> dict:
+    """An A2A AgentCard JSON shape with sensible defaults."""
+    base: dict[str, Any] = {
+        "name": name,
+        "description": f"A test {name} agent",
+        "url": f"https://internal/{name}",
+        "skills": [
+            {"name": "case-search", "description": "Search cases", "tags": ["legal", "uk"]},
+        ],
+        "provider": {"organization": "Acme Legal"},
+    }
+    base.update(overrides)
+    return base
+
+
+class TestHttpAgentRegistrySearch:
+    @pytest.mark.asyncio
+    async def test_search_decodes_cards(self) -> None:
+        transport = _registry_transport(list_response={
+            "agents": [_registry_card_json("legal_research")],
+        })
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        results = await registry.search()
+        await client.aclose()
+
+        assert len(results) == 1
+        assert results[0].name == "legal_research"
+        assert results[0].url == "https://internal/legal_research"
+        # provider object → flat string
+        assert results[0].provider == "Acme Legal"
+        # skills carry their tags
+        assert results[0].skills[0].tags == ["legal", "uk"]
+
+    @pytest.mark.asyncio
+    async def test_search_passes_filters_as_query_params(self) -> None:
+        captured: list[httpx.Request] = []
+        transport = _registry_transport(
+            list_response={"agents": []},
+            capture=captured,
+        )
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        await registry.search(query="legal", tags=["uk", "litigation"], limit=50)
+        await client.aclose()
+
+        sent_url = captured[-1].url
+        assert sent_url.params.get("q") == "legal"
+        # default mapping joins tags with comma
+        assert sent_url.params.get("tags") == "uk,litigation"
+        assert sent_url.params.get("limit") == "50"
+
+    @pytest.mark.asyncio
+    async def test_custom_query_param_mapping_is_used(self) -> None:
+        captured: list[httpx.Request] = []
+        transport = _registry_transport(
+            list_response={"agents": []},
+            capture=captured,
+        )
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+
+        def custom_mapping(filters: dict[str, Any]) -> dict[str, str]:
+            # Different backend uses different param names.
+            out: dict[str, str] = {}
+            if filters.get("query"):
+                out["search"] = str(filters["query"])
+            if filters.get("tags"):
+                out["category"] = filters["tags"][0]
+            return out
+
+        registry = HttpAgentRegistry(
+            base_url="https://registry",
+            client=client,
+            query_param_mapping=custom_mapping,
+        )
+        await registry.search(query="acme", tags=["legal"])
+        await client.aclose()
+
+        sent_url = captured[-1].url
+        assert sent_url.params.get("search") == "acme"
+        assert sent_url.params.get("category") == "legal"
+        # default-mapping params are NOT present
+        assert sent_url.params.get("q") is None
+        assert sent_url.params.get("tags") is None
+
+    @pytest.mark.asyncio
+    async def test_search_attaches_static_auth_headers(self) -> None:
+        captured: list[httpx.Request] = []
+        transport = _registry_transport(
+            list_response={"agents": []},
+            capture=captured,
+        )
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(
+            base_url="https://registry",
+            client=client,
+            auth={"Authorization": "Bearer reg-token"},
+        )
+
+        await registry.search()
+        await client.aclose()
+
+        assert captured[-1].headers["Authorization"] == "Bearer reg-token"
+
+    @pytest.mark.asyncio
+    async def test_search_callable_auth_is_recomputed(self) -> None:
+        counter = 0
+
+        def fresh() -> dict[str, str]:
+            nonlocal counter
+            counter += 1
+            return {"Authorization": f"Bearer t-{counter}"}
+
+        captured: list[httpx.Request] = []
+        transport = _registry_transport(
+            list_response={"agents": []},
+            capture=captured,
+        )
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(
+            base_url="https://registry",
+            client=client,
+            auth=fresh,
+        )
+
+        await registry.search()
+        await registry.search()
+        await client.aclose()
+
+        assert captured[0].headers["Authorization"] == "Bearer t-1"
+        assert captured[1].headers["Authorization"] == "Bearer t-2"
+
+    @pytest.mark.asyncio
+    async def test_search_ignores_non_dict_entries(self) -> None:
+        # Defensive: a registry that returns a malformed entry shouldn't
+        # crash the harness; we just drop the bad row.
+        transport = _registry_transport(list_response={
+            "agents": [
+                _registry_card_json("ok"),
+                "not-an-object",
+                {"name": "also_ok", "description": "", "url": ""},
+            ],
+        })
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        results = await registry.search()
+        await client.aclose()
+
+        assert {c.name for c in results} == {"ok", "also_ok"}
+
+
+class TestHttpAgentRegistryGet:
+    @pytest.mark.asyncio
+    async def test_get_returns_single_card(self) -> None:
+        transport = _registry_transport(get_responses={
+            "legal_research": _registry_card_json("legal_research"),
+        })
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        card = await registry.get("legal_research")
+        await client.aclose()
+
+        assert card.name == "legal_research"
+        assert card.provider == "Acme Legal"
+
+    @pytest.mark.asyncio
+    async def test_get_missing_card_raises_http_error(self) -> None:
+        transport = _registry_transport(get_responses={})
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await registry.get("missing")
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_provider_can_be_plain_string(self) -> None:
+        # Some registries return `provider` as a flat string. We tolerate.
+        transport = _registry_transport(get_responses={
+            "x": _registry_card_json("x", provider="Acme Inc."),
+        })
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        card = await registry.get("x")
+        await client.aclose()
+
+        assert card.provider == "Acme Inc."
+
+    @pytest.mark.asyncio
+    async def test_extra_fields_kept_in_metadata(self) -> None:
+        transport = _registry_transport(get_responses={
+            "x": _registry_card_json("x", version="1.2.3", cost_per_call=0.05),
+        })
+        client = httpx.AsyncClient(transport=transport, base_url="https://registry")
+        registry = HttpAgentRegistry(base_url="https://registry", client=client)
+
+        card = await registry.get("x")
+        await client.aclose()
+
+        assert card.metadata["version"] == "1.2.3"
+        assert card.metadata["cost_per_call"] == 0.05

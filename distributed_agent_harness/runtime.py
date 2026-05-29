@@ -15,15 +15,11 @@ doesn't block the event loop.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import logging
-import re
 from typing import Any, Type
 
 from pydantic import ValidationError, create_model
-
-from datetime import datetime, timezone
 
 from .conflict import (
     Abandon,
@@ -35,27 +31,28 @@ from .conflict import (
     Recover,
     fields_disjoint,
 )
-from .event_search import EventQuery, render_events_markdown, search_events
-from .eventlog import Appended, Event, EventLog
-from .hooks import ActionContext, BlockDecision, HookRegistry, SubagentContext
+from .eventlog import EventLog
+from .hooks import ActionContext, BlockDecision, HookRegistry
 from .llm import LLMProvider, Message, Role, ToolCall, ToolSchema
-from .namespace import NamespaceAdapter
-from .namespace_browse import (
-    DEFAULT_GREP_LIMIT,
-    DEFAULT_READ_LIMIT,
-    grep_docs,
-    list_dir,
-    read_doc,
-    render_grep,
-    render_ls,
-    render_read,
+from .meta_tools import (
+    GREP_TOOL,
+    LS_TOOL,
+    META_TOOL_NAMES,
+    READ_TOOL,
+    SEARCH_EVENT_LOG_TOOL,
+    all_meta_tool_schemas,
+    execute_grep,
+    execute_ls,
+    execute_read,
+    execute_search_event_log,
 )
+from .namespace import NamespaceAdapter
 from .prompt_builder import PromptBuilder
-from .subagents import (
-    Artefact,
-    SubagentRegistry,
-    SubagentResponse,
-    SubagentTimeout,
+from .subagents import SubagentRegistry
+from .subagents.dispatch import (
+    SUBAGENT_TOOL_PREFIX,
+    execute_subagent_call,
+    subagent_tool_schemas,
 )
 from .transport import OutputEvent, OutputEventKind, TriggerEvent
 from .world import ActionNotAvailable, BaseWorldEnvironment
@@ -64,14 +61,7 @@ from .world import ActionNotAvailable, BaseWorldEnvironment
 # Reserved built-in tool names. Any @action whose name collides with one of
 # these would be shadowed by the meta-tool dispatch — fail fast at runtime
 # construction rather than silently swallowing user actions.
-_SEARCH_EVENT_LOG_TOOL = "search_event_log"
-_LS_TOOL = "ls"
-_READ_TOOL = "read"
-_GREP_TOOL = "grep"
-_SUBAGENT_TOOL_PREFIX = "consult_"
-_RESERVED_TOOL_NAMES = frozenset({
-    _SEARCH_EVENT_LOG_TOOL, _LS_TOOL, _READ_TOOL, _GREP_TOOL,
-})
+_RESERVED_TOOL_NAMES: frozenset[str] = META_TOOL_NAMES
 
 log = logging.getLogger(__name__)
 
@@ -145,11 +135,11 @@ class AgentRuntime:
                 f"{sorted(clashes)}. Reserved names are: "
                 f"{sorted(_RESERVED_TOOL_NAMES)}."
             )
-        prefix_clashes = {n for n in action_names if n.startswith(_SUBAGENT_TOOL_PREFIX)}
+        prefix_clashes = {n for n in action_names if n.startswith(SUBAGENT_TOOL_PREFIX)}
         if prefix_clashes:
             raise ValueError(
                 f"@action name(s) start with reserved subagent prefix "
-                f"{_SUBAGENT_TOOL_PREFIX!r}: {sorted(prefix_clashes)}."
+                f"{SUBAGENT_TOOL_PREFIX!r}: {sorted(prefix_clashes)}."
             )
 
         self.world_class = world_class
@@ -401,24 +391,29 @@ class AgentRuntime:
             ))
 
         # ----- meta-tool: search_event_log
-        if call.name == _SEARCH_EVENT_LOG_TOOL:
-            return await self._execute_search_event_log(call, world, reply_to)
+        if call.name == SEARCH_EVENT_LOG_TOOL:
+            return await execute_search_event_log(
+                call, reply_to, self.eventlog, world._project_id,
+            )
 
         # ----- meta-tools: namespace navigation (ls / read / grep)
-        if call.name == _LS_TOOL:
-            return await self._execute_ls(call, reply_to)
-        if call.name == _READ_TOOL:
-            return await self._execute_read(call, reply_to)
-        if call.name == _GREP_TOOL:
-            return await self._execute_grep(call, reply_to)
+        if call.name == LS_TOOL:
+            return await execute_ls(call, reply_to, self.namespace)
+        if call.name == READ_TOOL:
+            return await execute_read(call, reply_to, self.namespace)
+        if call.name == GREP_TOOL:
+            return await execute_grep(call, reply_to, self.namespace)
 
         # ----- subagent: consult_<name>
-        if call.name.startswith(_SUBAGENT_TOOL_PREFIX):
-            subagent_name = call.name[len(_SUBAGENT_TOOL_PREFIX):]
+        if call.name.startswith(SUBAGENT_TOOL_PREFIX):
+            subagent_name = call.name[len(SUBAGENT_TOOL_PREFIX):]
             subagent = self.subagents.get(subagent_name)
             if subagent is not None:
-                return await self._execute_subagent_call(
+                return await execute_subagent_call(
                     call, subagent_name, subagent, world, reply_to, trigger,
+                    hooks=self.hooks,
+                    eventlog=self.eventlog,
+                    namespace=self.namespace,
                 )
 
         method = getattr(world, call.name, None)
@@ -640,327 +635,6 @@ class AgentRuntime:
                 # Unknown decision type — treat as Recover.
                 return Recover(), None
 
-    # ----------------------------------------------------------------------- #
-    # Tool dispatch — subagent (consult_<name>)                                #
-    # ----------------------------------------------------------------------- #
-
-    async def _execute_subagent_call(
-        self,
-        call: ToolCall,
-        subagent_name: str,
-        subagent: Any,
-        world: BaseWorldEnvironment,
-        reply_to: Any,
-        trigger: TriggerEvent,
-    ) -> Message:
-        """Dispatch a ``consult_<name>`` tool call to the subagent registry."""
-        message = call.arguments.get("message")
-        session_id = call.arguments.get("session_id")
-        if not isinstance(message, str) or not message:
-            error = f"Invalid arguments for {call.name}: 'message' is required"
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.ACTION_RESULT,
-                    payload={"name": call.name, "id": call.id, "error": error},
-                ))
-            return Message(
-                role=Role.TOOL,
-                content=error,
-                tool_call_id=call.id,
-                name=call.name,
-            )
-
-        # ----- pre_subagent_call hook
-        sub_ctx = SubagentContext(
-            project_id=world._project_id,
-            subagent_name=subagent_name,
-            message=message,
-            session_id=session_id if isinstance(session_id, str) else None,
-            trigger=trigger,
-        )
-        decision = await self.hooks.fire_pre_subagent_call(sub_ctx)
-        if decision is not None:
-            error = f"Subagent blocked: {decision.reason}"
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.ACTION_RESULT,
-                    payload={
-                        "name": call.name, "id": call.id,
-                        "error": error, "blocked": True,
-                    },
-                ))
-            return Message(
-                role=Role.TOOL,
-                content=error,
-                tool_call_id=call.id,
-                name=call.name,
-            )
-
-        # ----- progress callback: forward `working` deltas as THINKING events
-        async def _on_progress(delta: str) -> None:
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.THINKING,
-                    payload={
-                        "subagent": subagent_name,
-                        "delta": delta,
-                    },
-                ))
-
-        # ----- the consult itself
-        try:
-            response: SubagentResponse = await subagent.consult(
-                message=message,
-                session_id=sub_ctx.session_id,
-                on_progress=_on_progress,
-            )
-        except SubagentTimeout as exc:
-            await self._append_subagent_event(
-                world, subagent_name, message, sub_ctx.session_id,
-                status="failed", content=f"timeout: {exc}",
-            )
-            error = f"Subagent timed out: {exc}"
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.ACTION_RESULT,
-                    payload={"name": call.name, "id": call.id, "error": error},
-                ))
-            return Message(
-                role=Role.TOOL,
-                content=error,
-                tool_call_id=call.id,
-                name=call.name,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface to LLM
-            await self._append_subagent_event(
-                world, subagent_name, message, sub_ctx.session_id,
-                status="failed", content=str(exc),
-            )
-            error = f"Subagent error: {type(exc).__name__}: {exc}"
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.ACTION_RESULT,
-                    payload={"name": call.name, "id": call.id, "error": error},
-                ))
-            return Message(
-                role=Role.TOOL,
-                content=error,
-                tool_call_id=call.id,
-                name=call.name,
-            )
-
-        # ----- persist artefacts before recording the event so the event's
-        # result_summary can include their paths (grep-discoverable later)
-        artefact_records = _persist_artefacts(
-            self.namespace, world._project_id, response.artefacts,
-        )
-
-        # ----- record the consult event
-        await self._append_subagent_event(
-            world, subagent_name, message, sub_ctx.session_id,
-            status=response.status,
-            content=response.content,
-            returned_session_id=response.session_id,
-            artefact_records=artefact_records,
-        )
-
-        # ----- post_subagent_call hook
-        await self.hooks.fire_post_subagent_call(sub_ctx, response)
-
-        result_text = _render_subagent_response(
-            subagent_name, response, artefact_records,
-        )
-        if reply_to:
-            await reply_to.emit(OutputEvent(
-                kind=OutputEventKind.ACTION_RESULT,
-                payload={
-                    "name": call.name, "id": call.id,
-                    "result": result_text,
-                    "status": response.status,
-                    "session_id": response.session_id,
-                },
-            ))
-        return Message(
-            role=Role.TOOL,
-            content=result_text,
-            tool_call_id=call.id,
-            name=call.name,
-        )
-
-    async def _append_subagent_event(
-        self,
-        world: BaseWorldEnvironment,
-        subagent_name: str,
-        message: str,
-        session_id: str | None,
-        status: str,
-        content: str,
-        returned_session_id: str | None = None,
-        artefact_records: list[dict] | None = None,
-    ) -> None:
-        """Append a `consult_<name>` event with transparent CAS retry.
-
-        Subagent consults don't depend on the world's state, so any
-        intervening @action writes cannot invalidate them — we just keep
-        trying until our append wins. No conflict is surfaced to the LLM.
-
-        Artefact paths are inlined into ``result_summary`` so the LLM
-        can rediscover them later via ``search_event_log`` or ``grep``.
-        """
-        summary_parts = [
-            f"status={status}",
-            f"session={returned_session_id or session_id}",
-            f"content={_truncate_for_log(content)}",
-        ]
-        if artefact_records:
-            paths_inline = ", ".join(a["path"] for a in artefact_records)
-            summary_parts.append(f"artefacts=[{paths_inline}]")
-
-        event = Event(
-            project_id=world._project_id,
-            action_name=f"{_SUBAGENT_TOOL_PREFIX}{subagent_name}",
-            args=[],
-            kwargs={
-                "message": _truncate_for_log(message),
-                "session_id": session_id,
-            },
-            actor="agent",
-            result_summary=" ".join(summary_parts),
-        )
-        while True:
-            offset = await self.eventlog.current_offset(world._project_id)
-            result = await self.eventlog.append(
-                world._project_id, event, expected_offset=offset,
-            )
-            if isinstance(result, Appended):
-                return
-            # Conflict — refresh and try again. Subagent calls are
-            # commutative w.r.t. any concurrent @action.
-
-    # ----------------------------------------------------------------------- #
-    # Tool dispatch — search_event_log (read-only meta-tool)                   #
-    # ----------------------------------------------------------------------- #
-
-    async def _execute_search_event_log(
-        self,
-        call: ToolCall,
-        world: BaseWorldEnvironment,
-        reply_to: Any,
-    ) -> Message:
-        """Dispatch the built-in ``search_event_log`` meta-tool."""
-        args = call.arguments or {}
-        try:
-            query = EventQuery(
-                action_name_glob=args.get("action_name_glob"),
-                grep=args.get("grep"),
-                actor=args.get("actor"),
-                since=_parse_iso_datetime(args.get("since")),
-                until=_parse_iso_datetime(args.get("until")),
-                limit=int(args.get("limit") or 20),
-                offset_from=(
-                    int(args["offset_from"]) if args.get("offset_from") is not None else None
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            error = f"Invalid arguments for search_event_log: {exc}"
-            if reply_to:
-                await reply_to.emit(OutputEvent(
-                    kind=OutputEventKind.ACTION_RESULT,
-                    payload={"name": call.name, "id": call.id, "error": error},
-                ))
-            return Message(
-                role=Role.TOOL,
-                content=error,
-                tool_call_id=call.id,
-                name=call.name,
-            )
-
-        events = await search_events(self.eventlog, world._project_id, query)
-        result_text = render_events_markdown(events)
-        if reply_to:
-            await reply_to.emit(OutputEvent(
-                kind=OutputEventKind.ACTION_RESULT,
-                payload={"name": call.name, "id": call.id, "result": result_text},
-            ))
-        return Message(
-            role=Role.TOOL,
-            content=result_text,
-            tool_call_id=call.id,
-            name=call.name,
-        )
-
-    # ----------------------------------------------------------------------- #
-    # Tool dispatch — filesystem-style navigation (ls / read / grep)           #
-    # ----------------------------------------------------------------------- #
-    #
-    # These mirror Claude Code's / PI's baseline read tools so the agent can
-    # browse the project namespace as a virtual filesystem. They are
-    # read-only — no event appended, no hook fired. Writes still go through
-    # ``@actions``.
-
-    async def _execute_ls(self, call: ToolCall, reply_to: Any) -> Message:
-        args = call.arguments or {}
-        path = str(args.get("path", "") or "")
-        entries = list_dir(self.namespace, path)
-        result_text = render_ls(entries)
-        return await self._meta_tool_response(call, reply_to, result_text)
-
-    async def _execute_read(self, call: ToolCall, reply_to: Any) -> Message:
-        args = call.arguments or {}
-        path = args.get("path")
-        if not isinstance(path, str) or not path:
-            return await self._meta_tool_response(
-                call, reply_to,
-                "Invalid arguments for read: 'path' is required",
-                is_error=True,
-            )
-        offset = _coerce_optional_int(args.get("offset"))
-        limit = _coerce_optional_int(args.get("limit"))
-        content, meta = read_doc(self.namespace, path, offset=offset, limit=limit)
-        result_text = render_read(content, path, meta)
-        return await self._meta_tool_response(call, reply_to, result_text)
-
-    async def _execute_grep(self, call: ToolCall, reply_to: Any) -> Message:
-        args = call.arguments or {}
-        pattern = args.get("pattern")
-        if not isinstance(pattern, str) or not pattern:
-            return await self._meta_tool_response(
-                call, reply_to,
-                "Invalid arguments for grep: 'pattern' is required",
-                is_error=True,
-            )
-        path = str(args.get("path", "") or "")
-        glob = args.get("glob")
-        glob = glob if isinstance(glob, str) and glob else None
-        ignore_case = bool(args.get("ignore_case", False))
-        limit = _coerce_optional_int(args.get("limit")) or DEFAULT_GREP_LIMIT
-        matches = grep_docs(
-            self.namespace, pattern,
-            path=path, glob=glob, ignore_case=ignore_case, limit=limit,
-        )
-        result_text = render_grep(matches, limit=limit)
-        return await self._meta_tool_response(call, reply_to, result_text)
-
-    async def _meta_tool_response(
-        self,
-        call: ToolCall,
-        reply_to: Any,
-        result_text: str,
-        is_error: bool = False,
-    ) -> Message:
-        """Shared envelope for read-only meta-tools."""
-        if reply_to:
-            payload: dict[str, Any] = {"name": call.name, "id": call.id}
-            payload["error" if is_error else "result"] = result_text
-            await reply_to.emit(OutputEvent(
-                kind=OutputEventKind.ACTION_RESULT, payload=payload,
-            ))
-        return Message(
-            role=Role.TOOL,
-            content=result_text,
-            tool_call_id=call.id,
-            name=call.name,
-        )
 
     # ----------------------------------------------------------------------- #
     # Per-turn tool schema assembly                                            #
@@ -982,11 +656,8 @@ class AgentRuntime:
         """
         visible_actions = _visible_action_names(self.world_class, world.state, event)
         schemas = [s for s in self._action_tool_schemas if s.name in visible_actions]
-        schemas.extend(_subagent_tool_schemas(self.subagents, world.state, event))
-        schemas.append(_ls_tool_schema())
-        schemas.append(_read_tool_schema())
-        schemas.append(_grep_tool_schema())
-        schemas.append(_search_event_log_tool_schema())
+        schemas.extend(subagent_tool_schemas(self.subagents, world.state, event))
+        schemas.extend(all_meta_tool_schemas())
         return schemas
 
 
@@ -1097,355 +768,3 @@ def _visible_action_names(
     return visible
 
 
-def _subagent_tool_schemas(
-    registry: SubagentRegistry,
-    state: Any,
-    event: TriggerEvent | None,
-) -> list[ToolSchema]:
-    """One ``consult_<name>`` schema per registered subagent (filtered by show_when)."""
-    schemas: list[ToolSchema] = []
-    for sub in registry.list():
-        predicate = getattr(sub, "show_when", None)
-        if predicate is not None:
-            try:
-                if not bool(predicate(state, event)):
-                    continue
-            except Exception:  # noqa: BLE001
-                log.exception("subagent %r show_when raised; hiding", sub.name)
-                continue
-        schemas.append(ToolSchema(
-            name=f"{_SUBAGENT_TOOL_PREFIX}{sub.name}",
-            description=(
-                f"{sub.description}\n\n"
-                "Consult the external specialist. Pass session_id from a "
-                "prior response to continue the same conversation context; "
-                "omit it to start fresh."
-            ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The prompt to send the subagent.",
-                    },
-                    "session_id": {
-                        "type": "string",
-                        "description": (
-                            "Optional A2A contextId from a prior response. "
-                            "When set, the subagent resumes that conversation."
-                        ),
-                    },
-                },
-                "required": ["message"],
-            },
-        ))
-    return schemas
-
-
-def _search_event_log_tool_schema() -> ToolSchema:
-    """The built-in meta-tool every runtime exposes."""
-    return ToolSchema(
-        name=_SEARCH_EVENT_LOG_TOOL,
-        description=(
-            "Search this project's event log. All filters are optional and "
-            "compose with AND. Use this when Recent Activity in the system "
-            "prompt is too short to answer a question about prior activity — "
-            "for example to find a prior consult_<subagent> session_id, or "
-            "to confirm whether a particular action has already been taken."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "action_name_glob": {
-                    "type": "string",
-                    "description": (
-                        "fnmatch glob over action names. "
-                        "Examples: 'consult_*' (all subagent calls), "
-                        "'consult_legal_research' (one specific subagent), "
-                        "'notify_*' (everything starting with notify_)."
-                    ),
-                },
-                "grep": {
-                    "type": "string",
-                    "description": "Case-insensitive substring over the rendered line.",
-                },
-                "actor": {
-                    "type": "string",
-                    "description": "Exact match on actor (e.g. 'agent', 'human').",
-                },
-                "since": {
-                    "type": "string",
-                    "description": "ISO 8601 timestamp — only events at or after this time.",
-                },
-                "until": {
-                    "type": "string",
-                    "description": "ISO 8601 timestamp — only events before this time.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of results. Default 20.",
-                },
-                "offset_from": {
-                    "type": "integer",
-                    "description": "Only events at log offset >= this value (for pagination).",
-                },
-            },
-            "required": [],
-        },
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Namespace navigation tool schemas (ls / read / grep)                         #
-# --------------------------------------------------------------------------- #
-
-def _ls_tool_schema() -> ToolSchema:
-    return ToolSchema(
-        name=_LS_TOOL,
-        description=(
-            "List entries under a path in the project namespace. The "
-            "namespace is the agent's virtual filesystem: project state, "
-            "logs, subagent artefacts. Returns names with a '/' suffix for "
-            "subdirectories. Use this to discover documents that are not "
-            "already lifted into the system prompt."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Path prefix to list. Use the project id (e.g. "
-                        "'demo/') to see the top of the project, or a "
-                        "subdirectory like 'demo/artefacts/'. Defaults to "
-                        "the namespace root."
-                    ),
-                },
-            },
-            "required": [],
-        },
-    )
-
-
-def _read_tool_schema() -> ToolSchema:
-    return ToolSchema(
-        name=_READ_TOOL,
-        description=(
-            "Read a text document from the project namespace. Use this to "
-            "open documents found via `ls` or `grep` that are not lifted "
-            "into the system prompt — e.g. the full `event_log.md`, the "
-            "raw `audit.jsonl`, or any artefact dropped under "
-            "<project>/artefacts/. Reading does not change project state."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Full path of the document.",
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": (
-                        "1-indexed starting line. Use with `limit` to "
-                        "paginate large documents."
-                    ),
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": (
-                        f"Maximum lines to return. Defaults to "
-                        f"{DEFAULT_READ_LIMIT}; the response indicates "
-                        "whether content was truncated and how to continue."
-                    ),
-                },
-            },
-            "required": ["path"],
-        },
-    )
-
-
-def _grep_tool_schema() -> ToolSchema:
-    return ToolSchema(
-        name=_GREP_TOOL,
-        description=(
-            "Search document content across the project namespace. The "
-            "pattern is a Python regex (a bad pattern falls back to literal "
-            "substring search). Use this to find references — names, IDs, "
-            "specific topics — across all project documents."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "pattern": {
-                    "type": "string",
-                    "description": "Regex (or literal substring) to search for.",
-                },
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Restrict the search to documents whose path starts "
-                        "with this prefix. Defaults to the namespace root."
-                    ),
-                },
-                "glob": {
-                    "type": "string",
-                    "description": (
-                        "Optional fnmatch glob over full document paths "
-                        "(e.g. '*.md', '*/artefacts/*')."
-                    ),
-                },
-                "ignore_case": {
-                    "type": "boolean",
-                    "description": "Case-insensitive match. Default False.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": (
-                        f"Maximum number of matches. Default "
-                        f"{DEFAULT_GREP_LIMIT}."
-                    ),
-                },
-            },
-            "required": ["pattern"],
-        },
-    )
-
-
-def _coerce_optional_int(value: Any) -> int | None:
-    """Coerce LLM-supplied numeric kwargs into ``int | None`` defensively."""
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# Subagent response rendering + small utilities                                #
-# --------------------------------------------------------------------------- #
-
-def _render_subagent_response(
-    subagent_name: str,
-    response: SubagentResponse,
-    artefact_records: list[dict] | None = None,
-) -> str:
-    """Format a SubagentResponse as the TOOL-message body the LLM reads.
-
-    The status word is at the start so the LLM can branch on it quickly.
-    For ``input-required`` we tell the model exactly what to do — call
-    consult_<name> again with the same session_id. Persisted artefact
-    paths are surfaced inline so the LLM can ``read`` them immediately.
-    """
-    parts = [f"[{response.status}]"]
-    if response.session_id:
-        parts.append(f"session_id={response.session_id}")
-    parts.append(response.content or "")
-    body = " ".join(p for p in parts if p)
-    if artefact_records:
-        bullet_lines = [
-            f"- `{a['path']}` — {a['name']}"
-            + (f" ({a['mime']})" if a.get("mime") else "")
-            + (f" — {a['description']}" if a.get("description") else "")
-            for a in artefact_records
-        ]
-        body += (
-            "\n\nArtefacts written to the project namespace:\n"
-            + "\n".join(bullet_lines)
-            + "\nUse `read` on any of the paths above to inspect them."
-        )
-    if response.status == "input-required":
-        body += (
-            f"\n\nTo continue, call `consult_{subagent_name}` again with "
-            f"`session_id=\"{response.session_id}\"` and your reply as `message`."
-        )
-    return body
-
-
-# --------------------------------------------------------------------------- #
-# Subagent artefact persistence                                                #
-# --------------------------------------------------------------------------- #
-
-_ARTEFACT_DIR = "artefacts"
-_SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
-def _persist_artefacts(
-    namespace: NamespaceAdapter,
-    project_id: str,
-    artefacts: list[Artefact],
-) -> list[dict]:
-    """Write each artefact to the project namespace.
-
-    Paths are content-addressable: ``<project>/artefacts/<sha[:8]>__<name>``.
-    This decouples the path from the event offset (so CAS retries don't
-    relocate files) while keeping the name human-readable. Identical
-    bytes dedupe naturally.
-
-    Returns one record per artefact: ``{path, name, size, mime, sha256,
-    description}``. The runtime threads these into the consult event and
-    the TOOL response.
-    """
-    records: list[dict] = []
-    for art in artefacts:
-        sha = hashlib.sha256(art.content).hexdigest()
-        safe_name = _sanitise_artefact_name(art.name)
-        path = f"{project_id}/{_ARTEFACT_DIR}/{sha[:8]}__{safe_name}"
-        # write_binary may raise NotImplementedError on text-only adapters
-        # — that's a legitimate operator error; surface it rather than
-        # silently dropping the artefact.
-        namespace.write_binary(path, art.content)
-        mime = art.mime
-        if mime is None:
-            info = namespace.doc_info(path)
-            mime = info.mime if info is not None else None
-        records.append({
-            "path": path,
-            "name": art.name,
-            "size": len(art.content),
-            "mime": mime,
-            "sha256": sha,
-            "description": art.description,
-        })
-    return records
-
-
-def _sanitise_artefact_name(name: str) -> str:
-    """Replace path-unsafe characters with ``_`` while keeping the extension.
-
-    Trims to a sane length so the path stays well below filesystem limits
-    on the various namespace backends we plan to support (S3, SharePoint).
-    """
-    cleaned = _SANITISE_RE.sub("_", name).strip("._")
-    if not cleaned:
-        cleaned = "artefact.bin"
-    if len(cleaned) > 80:
-        # Keep the extension; truncate the stem.
-        if "." in cleaned:
-            stem, _, ext = cleaned.rpartition(".")
-            cleaned = stem[: 80 - len(ext) - 1] + "." + ext
-        else:
-            cleaned = cleaned[:80]
-    return cleaned
-
-
-def _truncate_for_log(text: str, max_len: int = 80) -> str:
-    """Trim long strings for compact event-log entries."""
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1] + "…"
-
-
-def _parse_iso_datetime(raw: Any) -> datetime | None:
-    """Parse an ISO-8601 string; return None for empty/None inputs."""
-    if raw is None or raw == "":
-        return None
-    if isinstance(raw, datetime):
-        return raw
-    if not isinstance(raw, str):
-        raise TypeError(f"expected ISO-8601 string, got {type(raw).__name__}")
-    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed
