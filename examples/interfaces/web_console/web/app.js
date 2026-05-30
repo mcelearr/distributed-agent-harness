@@ -65,10 +65,49 @@ function appendLine(cls, label, text) {
   $("log").scrollTop = $("log").scrollHeight;
 }
 
+// Assistant messages are rendered as markdown so things like `code spans`,
+// bullet lists, and code blocks display the way a chat UI is expected to.
+// User input and action call/result lines stay plain text because they're
+// structured content, not authored prose.
+function appendAssistantMarkdown(text) {
+  const div = document.createElement("div");
+  div.className = "msg assistant";
+
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = "agent";
+  div.appendChild(label);
+
+  const body = document.createElement("span");
+  body.className = "md";
+  body.innerHTML = renderMarkdown(text || "");
+  div.appendChild(body);
+
+  $("log").appendChild(div);
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function renderMarkdown(text) {
+  if (typeof marked !== "undefined") {
+    try {
+      return marked.parse(text, { gfm: true, breaks: true });
+    } catch (e) {
+      console.warn("marked.parse failed; falling back to plain text", e);
+    }
+  }
+  // Fallback: escape HTML, preserve newlines.
+  const escaped = text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\n/g, "<br>");
+  return escaped;
+}
+
 function renderEvent(evt) {
   const { kind, payload } = evt;
   if (kind === "message") {
-    appendLine("assistant", "agent", payload.content || "");
+    appendAssistantMarkdown(payload.content || "");
   } else if (kind === "action_called") {
     const args = formatArgs(payload.args || {});
     appendLine("action", "↪", `${payload.name}(${args})`);
