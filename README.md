@@ -6,38 +6,92 @@ A framework for building **multi-actor agent systems that operate on shared busi
 
 If you've used Claude Code or Cursor you've seen the classic "single-agent + local filesystem + arbitrary shell" harness pattern. That pattern breaks the moment you try to run a regulated business process on it: state isn't shared, writes aren't audited, two actors can't operate on the same project, and there's no way to gate sensitive operations. DAH keeps what LLMs are good at — navigating filesystems — and replaces what's dangerous with typed actions and event-sourced concurrency.
 
-### What's different from a standard agent harness
+## Quick start
 
-#### 1. Code-as-harness
+The fastest way to try DAH is the bundled **web console** — a browser UI that runs against the example use cases in this repo. Pick one from the dropdown, send chat messages, and watch the agent reason, call typed actions, and update the project namespace.
+
+> The web console is itself an **example** ([`examples/interfaces/web_console/`](examples/interfaces/web_console/)) — not part of the published SDK. It exists so contributors and evaluators have a zero-effort UI to demo with. Production users build their own UI against the public `TriggerSource` / `OutputChannel` interfaces.
+
+### Prerequisites
+- Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/) (or any other Python package manager)
+- A Mistral API key — free tier works, get one at [console.mistral.ai](https://console.mistral.ai)
+
+### Run it
+
+```bash
+# 1. Clone and install (including the optional `examples` dependency group)
+git clone https://github.com/mcelearr/distributed-agent-harness
+cd distributed-agent-harness
+uv sync --group examples
+
+# 2. Set your LLM API key
+export MISTRAL_API_KEY=...
+
+# 3. Launch the console
+uv run python -m examples.interfaces.web_console
+```
+
+Then open [http://localhost:8765](http://localhost:8765). The dropdown lists the example use cases registered in [`examples/interfaces/web_console/worlds.toml`](examples/interfaces/web_console/worlds.toml) — today that's the Data Protection / GDPR example; adding more is a one-line config change.
+
+### What else is in the repo
+
+| Path | What it is |
+|---|---|
+| `distributed_agent_harness/` | The SDK — the only thing in the published wheel. |
+| `examples/use_cases/` | `WorldEnvironment` implementations (domain logic). |
+| `examples/interfaces/` | `TriggerSource` / `OutputChannel` adapters (the web console lives here). |
+| `examples/adapters/` | Reserved for future `NamespaceAdapter` / `EventLog` / `MessageBus` examples. |
+| `tests/` | SDK test suite. Per-example tests live next to each example. |
+
+Run any example directly without the LLM:
+
+```bash
+uv run python -m examples.use_cases.data_protection.run
+```
+
+---
+
+## Why DAH
+
+DAH is a positioning bet that there's a class of agent system — multi-actor, regulated, written by domain experts, deployed at company scale — that none of today's harnesses serve. Three platforms sit closest in the field:
+
+- **[Pi Coding Agent](https://pi.dev)** is a Claude Code-style terminal coding agent — a single user working a local repo, with `read` / `write` / `edit` / `bash` as default tools and TypeScript extensions for everything else.
+- **[Microsoft Agent Framework (MAF)](https://github.com/microsoft/agent-framework)** is the production convergence of Semantic Kernel + AutoGen — a polyglot (Python + .NET) framework for graph-based workflows, durable execution, and Azure-hosted multi-agent systems.
+- **[n8n](https://n8n.io)** is a fair-code workflow automation platform with a visual graph editor, 400+ integrations, and (since May 2026) first-class HITL approval gates on AI Agent tool calls.
+
+The rest of this section walks the seven capabilities DAH is built around, then compares all four platforms across them. Where a competitor leads, it's called out.
+
+### 1. Code-as-harness
 
 Business logic is described in *code* — typed `@action` methods on a `WorldEnvironment` class — not natural-language tool descriptions. The LLM is given the method signature, docstring, **and the actual Python source body** (extracted via AST), so it can reason about *how* a call will mutate state, not just what it's named.
 
-This is a positioning bet: the right substrate for an LLM to reason about a regulated business process is code, not prose. Code carries semantic precision that a one-line tool description never can. LLMs already interpret code fluently; the next step is generating new `WorldEnvironment`s outright from a conversation with a domain expert.
+This is the central positioning bet: the right substrate for an LLM to reason about a regulated business process is code, not prose. Code carries semantic precision that a one-line tool description never can. LLMs already interpret code fluently; the next step is generating new `WorldEnvironment`s outright from a conversation with a domain expert.
 
-#### 2. Filesystem-as-virtual-environment — read freely, write through gates
+### 2. Filesystem-as-virtual-environment — read freely, write through gates
 
 Reads and writes are deliberately asymmetric:
 
 - **Read** — LLMs have become very good at exploring filesystems with bash-style tools. We lean in: `ls`, `read`, `grep` over the project namespace are always-on meta-tools, including binary documents (PDFs, images). Same mental model as Claude Code.
-- **Write** — every mutation goes through a typed `@action` declared by the implementer. No arbitrary edits. No shell escape hatch. Each call is appended to a tamper-evident event log with caller identity, arguments, before/after state hashes, and outcome.
+- **Write** — every mutation goes through a typed `@action` declared by the implementer. No arbitrary edits. No shell escape hatch. Each call is appended to a tamper-evident event log with caller identity, arguments, and outcome.
 
-#### 3. Concurrent multi-actor writes, with the agent as conflict resolver
+### 3. Concurrent multi-actor writes, with the agent as conflict resolver
 
 Multiple humans and multiple agents can write to the same project state simultaneously. Conflicts are resolved by **event sourcing + optimistic CAS**: when another actor has appended events under you, the runtime hands the LLM a structured prompt with the intervening events and lets it decide **Continue** (my plan is still valid), **Recover** (re-plan against the new state), or **Abandon**. A structural pre-check (`reads` / `writes` declared per action) auto-resolves disjoint conflicts without an LLM round-trip.
 
 This is the architectural bet on concurrency: locks don't compose across data centres, and LLMs are uniquely well-suited to "read the diff and decide if my plan still survives."
 
-#### 4. Shared, human-readable memory
+### 4. Shared, human-readable memory
 
 Project state lives in a swappable document store as Markdown / YAML / JSON. Never binary blobs. A human reviewer can open the project namespace directly — read `summary.md`, scan `event_log.md`, audit `state.json` — without tooling, training, or a vendor UI. The adapter interface is three methods; in-memory ships today, SharePoint / Drive / S3 are planned.
 
-#### 5. Vibe-code to production on the same code path
+### 5. Vibe-code to production on the same code path
 
 Non-technical and semi-technical builders (product owners, ops leads, analysts) increasingly describe what they want **to an AI**, in code, rather than dragging boxes around a no-code canvas. The historical trade-off was painful: no-code is accessible but a dead end (you outgrow the canvas, you lose git, you lose tests, you lose the debugger); real code is powerful but inaccessible.
 
 DAH is the opinionated guardrail that makes vibe-coded business processes safe to ship. The builder describes their domain to their LLM; the LLM emits a `WorldEnvironment` subclass; the whole thing runs end-to-end in memory on a laptop, is unit-tested in pytest, is version-controlled in git — and the **same code** drops into a Kafka + SharePoint production deployment with no rewrites. The LLM isn't expected to generate the safe enterprise execution layer; DAH provides it.
 
-#### 6. Pluggable across every axis
+### 6. Pluggable across every axis
 
 | Concern | Interface | Shipped | Planned |
 |---|---|---|---|
@@ -48,17 +102,11 @@ DAH is the opinionated guardrail that makes vibe-coded business processes safe t
 | Conflict resolution | `ConflictResolver` | `AgentDrivenConflictResolver`, `AlwaysRecoverResolver` | — |
 | LLM | none required (framework-agnostic) | — | — |
 
-#### 7. Zero cloud dependencies for local dev
+### 7. Zero cloud dependencies for local dev
 
 The whole stack runs in-process. `InMemoryNamespace` + `InMemoryEventLog` is the default. The Kafka and SharePoint adapters are a *deployment concern*, not an application concern — changing them touches no domain code.
 
-## How DAH compares
-
-This section measures DAH against three platforms in adjacent space on the seven capabilities above. The comparison is intentionally honest — where a competitor leads, that's called out.
-
-- **[Pi Coding Agent](https://pi.dev)** is a Claude Code-style terminal coding agent — a single user working a local repo, with `read` / `write` / `edit` / `bash` as default tools and TypeScript extensions for everything else.
-- **[Microsoft Agent Framework (MAF)](https://github.com/microsoft/agent-framework)** is the production convergence of Semantic Kernel + AutoGen — a polyglot (Python + .NET) framework for graph-based workflows, durable execution, and Azure-hosted multi-agent systems.
-- **[n8n](https://n8n.io)** is a fair-code workflow automation platform with a visual graph editor, 400+ integrations, and (since May 2026) first-class HITL approval gates on AI Agent tool calls.
+### How DAH compares
 
 | Capability | DAH | PI | MAF | n8n |
 |---|---|---|---|---|
@@ -86,66 +134,6 @@ This section measures DAH against three platforms in adjacent space on the seven
 ---
 
 ## System Design
-
-### Architecture
-
-```mermaid
-graph TD
-    subgraph Actors["Actors"]
-        A1["🤖 Agent A"]
-        A2["🤖 Agent B"]
-        H["👤 Human"]
-    end
-
-    subgraph HarnessCore["Harness Core"]
-        PB["Prompt Builder"]
-        HOOKS["Hook Registry — pre_action / post_action / action_error / pre_trigger / run_complete"]
-        IMPL["UserWorldEnvironment"]
-        BASE["BaseWorldEnvironment"]
-        IMPL -. "inherits" .-> BASE
-    end
-
-    subgraph ConcurrencyLayer["Concurrency Handler — pluggable"]
-        CH["ConcurrencyHandler"]
-        CR["Redis distributed lock"]
-        CK["Kafka / message queue"]
-        CL["In-process Lock"]
-        CH -. "impl" .-> CR
-        CH -. "impl" .-> CK
-        CH -. "impl" .-> CL
-    end
-
-    subgraph NamespaceLayer["Project Namespace — pluggable"]
-        NS["NamespaceAdapter"]
-        NM["In-memory (default)"]
-        NSP["SharePoint"]
-        NGD["Google Drive"]
-        NS3["S3 / Blob Store"]
-        NS -. "impl" .-> NM
-        NS -. "impl" .-> NSP
-        NS -. "impl" .-> NGD
-        NS -. "impl" .-> NS3
-    end
-
-    A1 -->|"① read context"| PB
-    A2 -->|"① read context"| PB
-    H -->|"direct r/w"| IMPL
-    PB -. "introspects via AST" .-> IMPL
-    A1 -->|"② call method"| IMPL
-    A2 -->|"② call method"| IMPL
-    BASE -->|"③ acquire lock + read"| CH
-    BASE -->|"⑤ write + release"| CH
-    CH -->|"④ ⑤ read / write state"| NS
-```
-
-**Call sequence for a single method invocation:**
-1. At startup, the Prompt Builder introspects `UserWorldEnvironment` via AST and injects method signatures, docstrings, and source bodies into the LLM context window
-2. The agent (or human) decides to invoke an action method on `UserWorldEnvironment`
-3. `BaseWorldEnvironment` calls the Concurrency Handler: **acquire lock**, then **read latest state** from the Namespace into memory
-4. The method executes against the freshly-loaded in-memory state
-5. `BaseWorldEnvironment` calls the Concurrency Handler: **write new state** to the Namespace, then **release lock**
-
----
 
 ### Components
 
@@ -188,8 +176,8 @@ The World Environment is a Python class that an implementer writes for their spe
 
 **`BaseWorldEnvironment`** (provided by the harness) handles:
 - Loading project state from the Namespace into a typed Python object on startup
-- Persisting state changes back to the Namespace after every method call (via the Concurrency Handler)
-- Wiring up the lock/read/write/release cycle transparently
+- Persisting state changes back to the Namespace after every `@action` call
+- Appending every call to the event log and detecting conflicts via optimistic CAS
 
 **`UserWorldEnvironment`** (written by the implementer) contains:
 - Domain-specific **state fields** — the attributes that represent what is true about the project right now
@@ -291,24 +279,40 @@ async def alert_oncall(ctx: ActionContext, exc: BaseException) -> None:
 
 A blocked action is surfaced to the LLM as a TOOL message containing the reason — the agent then has the opportunity to explain the block to the user or take a different action. Blocked triggers short-circuit the whole run with an ERROR event on the OutputChannel.
 
-#### 6. Concurrency Handler *(pluggable distributed coordination)*
+#### 6. Concurrency model *(event sourcing + optimistic CAS + agent-driven resolution)*
 
-The Concurrency Handler sits between `BaseWorldEnvironment` and the Namespace. Its job is to ensure that concurrent method calls from multiple agents or humans do not corrupt the shared state.
+DAH does **not** use locks. Concurrent writes are coordinated through an append-only event log plus optimistic compare-and-swap. The design assumption is that locks don't compose across data centres, but LLMs are well-suited to "read the diff and decide if my plan still survives."
 
-The `ConcurrencyHandler` interface:
+**The mechanism, per `@action` call:**
+
+1. On entry the action records the current end-of-log offset as its "last seen" position.
+2. The action executes against in-memory state.
+3. On exit the action tries to append its `Event` with that offset as a CAS token. If the log has advanced — i.e. another actor appended in between — the append fails with `ConcurrentUpdate` and the runtime invokes the `ConflictResolver`.
+
+The resolver sees a `ConflictContext` carrying the intervening events plus the planned tool call, and returns one of:
+
+| Decision | Meaning |
+|---|---|
+| `Continue` | The plan is still valid against the new state — retry the same call. |
+| `Recover` | The plan is stale — rebuild the system prompt with fresh state and let the LLM re-plan. The conversation is preserved; only the next assistant turn is regenerated. |
+| `Abandon(reason)` | Stop the run and report back to the user. |
 
 ```python
-class ConcurrencyHandler:
-    def acquire_lock(self, namespace: str, timeout: float) -> None: ...
-    def release_lock(self, namespace: str) -> None: ...
-    def read_state(self, adapter: NamespaceAdapter) -> WorldState: ...
-    def write_state(self, adapter: NamespaceAdapter, state: WorldState) -> None: ...
+class ConflictResolver(ABC):
+    async def resolve(
+        self,
+        ctx: ConflictContext,
+        llm: LLMProvider | None = None,
+    ) -> Decision: ...
 ```
 
-**Shipped adapters (v1):** `InProcessLock` (threading.Lock, single-machine)
-**Planned adapters:** Redis distributed lock (multi-pod, same cluster), Kafka-based event log (full event sourcing)
+**Shipped resolvers:**
+- `AgentDrivenConflictResolver` *(default)* — asks the LLM to choose `Continue` / `Recover` / `Abandon`, given the intervening events and the planned action.
+- `AlwaysRecoverResolver` — safe deterministic default for low-trust environments and tests; never consults the LLM.
 
-The choice of adapter is a deployment concern, not an application concern. A team running everything in one Kubernetes namespace can use Redis; a team wanting full event history can use Kafka; a developer running locally uses the in-process lock.
+**Structural pre-check.** Before invoking the resolver the runtime checks whether the planned action's declared `reads` / `writes` fields are disjoint from the writes of the intervening events. If they are, the conflict is materially harmless and the runtime auto-`Continue`s without an LLM round-trip. This is the cheap fast-path that keeps the common "two actors editing unrelated parts of the same project" case lock-free *and* LLM-free.
+
+**Persistence is pluggable too.** The append-only log itself sits behind an `EventLog` ABC. `InMemoryEventLog` ships and runs locally; `KafkaEventLog` is the planned production backend. The application code is identical in either deployment.
 
 ---
 
@@ -320,22 +324,22 @@ The choice of adapter is a deployment concern, not an application concern. A tea
 |----|-------------|
 | F1 | Multiple agents must be able to operate on the same Project Namespace concurrently without data corruption |
 | F2 | Human actors must be able to read and write to the Project Namespace alongside agents |
-| F3 | Every method invocation must be recorded with: caller identity, method name, parameters, timestamp, before/after state hash, and outcome — in an append-only audit log |
+| F3 | Every `@action` invocation must be recorded in an append-only audit log with: actor identity, method name, parameters, timestamp, log offset, and outcome (result type or error) |
 | F4 | The LLM must receive method signatures, docstrings, and optionally the source body for each action — not just a name |
 | F5 | Project state must be human-readable at rest (Markdown / YAML / JSON); no binary serialization |
 | F6 | The storage backend must be swappable at runtime by providing a different `NamespaceAdapter` — no changes to agent or environment code |
-| F7 | The concurrency backend must be swappable by providing a different `ConcurrencyHandler` — no changes to agent or environment code |
+| F7 | The conflict-resolution policy must be swappable by providing a different `ConflictResolver`, and the persistence backend by providing a different `EventLog` — no changes to agent or environment code |
 | F8 | A new domain implementation requires writing exactly one Python class that inherits from `BaseWorldEnvironment` |
-| F9 | No agent action may execute against a stale state snapshot — every call must read the latest state from the Namespace before executing |
+| F9 | No agent action may commit against a stale state snapshot — every successful append must win the optimistic-CAS check on the current event-log offset |
 
 #### Non-Functional
 
 | ID | Requirement |
 |----|-------------|
 | N1 | The harness must be LLM-framework agnostic (no hard dependency on LangChain, OpenAI SDK, etc.) |
-| N2 | The system must be fully runnable with zero cloud dependencies using `InMemoryNamespace` + `InProcessLock` |
+| N2 | The system must be fully runnable with zero cloud dependencies using `InMemoryNamespace` + `InMemoryEventLog` |
 | N3 | Arbitrary shell command execution must not be possible through the agent action interface |
-| N4 | The base harness must ship with 100% test coverage on the lock/read/write/release cycle |
+| N4 | The base harness must ship with comprehensive test coverage on the event-sourcing / conflict-resolution cycle (CAS append, `ConcurrentUpdate`, `Continue` / `Recover` / `Abandon` decisions, structural pre-check) |
 
 ---
 
