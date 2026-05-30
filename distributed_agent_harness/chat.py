@@ -46,8 +46,10 @@ async def _main_async(args: argparse.Namespace) -> int:
     if not os.environ.get("MISTRAL_API_KEY"):
         print(
             "error: MISTRAL_API_KEY is not set.\n"
-            "  Get one at https://console.mistral.ai → API keys.\n"
-            "  Then: export MISTRAL_API_KEY=...",
+            "  Get one at https://console.mistral.ai → API keys, then either:\n"
+            "    - put it in a .env file and run:\n"
+            "        uv run --env-file .env python -m distributed_agent_harness.chat\n"
+            "    - or export it directly: export MISTRAL_API_KEY=...",
             file=sys.stderr,
         )
         return 2

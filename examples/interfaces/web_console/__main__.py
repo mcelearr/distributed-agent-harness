@@ -2,8 +2,8 @@
 
 Usage::
 
-    export MISTRAL_API_KEY=...
-    python -m examples.interfaces.web_console \\
+    cp .env.example .env                  # then edit .env, paste in your key
+    uv run --env-file .env python -m examples.interfaces.web_console \\
         --worlds examples/interfaces/web_console/worlds.toml
 
 Then visit http://localhost:8765 in a browser.

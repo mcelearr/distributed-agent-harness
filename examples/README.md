@@ -34,12 +34,14 @@ exercise the world environment directly:
 python -m examples.use_cases.data_protection.run
 ```
 
-The web console requires an LLM key and the `examples` dependency group:
+The web console requires an LLM key and the `examples` dependency group.
+The key lives in a local `.env` file (git-ignored); `uv run --env-file`
+loads it into the subprocess for one command:
 
 ```bash
 uv sync --group examples
-export MISTRAL_API_KEY=...
-python -m examples.interfaces.web_console
+cp .env.example .env              # then edit .env and paste in your key
+uv run --env-file .env python -m examples.interfaces.web_console
 # → http://localhost:8765
 ```
 

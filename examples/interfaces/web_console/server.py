@@ -143,6 +143,9 @@ def require_api_key() -> None:
     """Sanity-check that an LLM key is present before binding the port."""
     if not os.environ.get("MISTRAL_API_KEY"):
         raise SystemExit(
-            "MISTRAL_API_KEY is not set. Export it before starting the console:\n"
-            "  export MISTRAL_API_KEY=..."
+            "MISTRAL_API_KEY is not set.\n"
+            "  - If you have a .env file at the repo root, run with:\n"
+            "      uv run --env-file .env python -m examples.interfaces.web_console\n"
+            "  - Otherwise create one: cp .env.example .env, paste in your key.\n"
+            "  - Or export the variable directly: export MISTRAL_API_KEY=..."
         )

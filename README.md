@@ -15,7 +15,7 @@ The fastest way to try DAH is the bundled **web console** — a browser UI that 
 ### Prerequisites
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/) (or any other Python package manager)
-- A Mistral API key — free tier works, get one at [console.mistral.ai](https://console.mistral.ai)
+- A Mistral API key — free tier works, get one at [console.mistral.ai](https://console.mistral.ai). You'll paste it into a local `.env` file in the next section; it never gets committed.
 
 ### Run it
 
@@ -25,14 +25,17 @@ git clone https://github.com/mcelearr/distributed-agent-harness
 cd distributed-agent-harness
 uv sync --group examples
 
-# 2. Set your LLM API key
-export MISTRAL_API_KEY=...
+# 2. Create your local .env from the template and fill in MISTRAL_API_KEY
+cp .env.example .env
+# …then open .env in your editor and paste in your key.
 
-# 3. Launch the console
-uv run python -m examples.interfaces.web_console
+# 3. Launch the console, loading .env into the process
+uv run --env-file .env python -m examples.interfaces.web_console
 ```
 
 Then open [http://localhost:8765](http://localhost:8765). The dropdown lists the example use cases registered in [`examples/interfaces/web_console/worlds.toml`](examples/interfaces/web_console/worlds.toml) — today that's the Data Protection / GDPR example; adding more is a one-line config change.
+
+> The `--env-file` flag is `uv`'s built-in way to inject the contents of a `.env` file into the subprocess environment for one command. `.env` itself is git-ignored; only `.env.example` is checked in.
 
 ### What else is in the repo
 
