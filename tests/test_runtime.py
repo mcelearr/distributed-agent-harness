@@ -55,6 +55,29 @@ class TodoWorld(BaseWorldEnvironment):
         return len(self.state.items)
 
 
+# Module-level fixtures for the forward-ref regression test below. Defined here
+# (not in the test method) so that `typing.get_type_hints` can resolve the
+# annotation `priority: _Priority` against this module's globals — mirroring
+# how real domain worlds (e.g. DataProtectionWorldEnvironment) import their
+# enums at module scope.
+from enum import Enum
+
+
+class _Priority(str, Enum):
+    LOW = "low"
+    HIGH = "high"
+
+
+class _PriorityWorld(BaseWorldEnvironment):
+    State = TodoState
+
+    @action
+    def add_with_priority(self, text: str, priority: _Priority) -> str:
+        """Add a prioritised item."""
+        self.state.items.append(f"[{priority.value}] {text}")
+        return text
+
+
 class FakeLLM(LLMProvider):
     """LLM that returns pre-scripted responses in order."""
 
@@ -137,6 +160,34 @@ class TestToolSchemas:
         schemas, _ = _build_tool_schemas(TodoWorld)
         add_item = next(s for s in schemas if s.name == "add_item")
         assert "todo list" in add_item.description.lower()
+
+    def test_forward_ref_enum_param_resolves(self) -> None:
+        """Regression: worlds using `from __future__ import annotations` plus
+        a non-builtin (e.g. enum) parameter type used to crash here because
+        ``inspect.signature`` returns the annotation as a string and pydantic
+        couldn't resolve the forward reference inside ``create_model``.
+
+        The fix is to resolve hints via ``typing.get_type_hints`` against the
+        method's module globals before handing them to pydantic.
+
+        Mirrors the production failure shape: an enum imported at module level
+        is referenced by a method whose annotation is a string at runtime
+        (because this file uses `from __future__ import annotations`).
+        """
+        # _PriorityWorld and _Priority are defined at module scope (below) so
+        # that get_type_hints resolves the forward ref against module globals,
+        # exactly like BreachSeverity / DataProtectionWorldEnvironment do.
+        schemas, models = _build_tool_schemas(_PriorityWorld)
+        add = next(s for s in schemas if s.name == "add_with_priority")
+        priority_schema = add.parameters["properties"]["priority"]
+        # Pydantic renders enums as a `$ref` to a `$defs` entry; both shapes
+        # are acceptable as long as we got past the crash.
+        assert "enum" in priority_schema or "$ref" in priority_schema
+        # Validating actual arguments through the params model must also work.
+        validated = models["add_with_priority"].model_validate(
+            {"text": "ship it", "priority": "high"}
+        )
+        assert validated.priority is _Priority.HIGH
 
 
 # --------------------------------------------------------------------------- #

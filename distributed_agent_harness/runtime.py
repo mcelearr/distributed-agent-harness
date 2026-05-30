@@ -701,15 +701,34 @@ def _params_model_for(name: str, method: Any):
 
     The model is used both to generate the JSON schema for the LLM and to
     validate incoming tool-call arguments before invoking the method.
+
+    Annotations are resolved via ``typing.get_type_hints`` so that worlds
+    defined under ``from __future__ import annotations`` (where every
+    annotation is a string at runtime) yield real types — otherwise pydantic
+    would receive forward references like ``'BreachSeverity'`` and fail at
+    ``model_json_schema()`` time with a "class not fully defined" error.
     """
+    import typing
+
     sig = inspect.signature(method)
+    # ``get_type_hints`` resolves forward references against the method's
+    # module globals. The ``include_extras=True`` keeps any ``Annotated[...]``
+    # metadata (we don't use it today, but cheap to preserve).
+    try:
+        resolved_hints = typing.get_type_hints(method, include_extras=True)
+    except Exception:  # noqa: BLE001 — fall back to raw annotations
+        resolved_hints = {}
+
     fields: dict[str, Any] = {}
     for param_name, param in sig.parameters.items():
         if param_name == "self":
             continue
-        annotation = (
-            param.annotation if param.annotation is not inspect.Parameter.empty else Any
-        )
+        if param_name in resolved_hints:
+            annotation = resolved_hints[param_name]
+        elif param.annotation is not inspect.Parameter.empty:
+            annotation = param.annotation
+        else:
+            annotation = Any
         default = param.default if param.default is not inspect.Parameter.empty else ...
         fields[param_name] = (annotation, default)
 
