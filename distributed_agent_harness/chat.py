@@ -83,7 +83,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--world",
-        default="examples.data_protection.world:DataProtectionWorldEnvironment",
+        default="examples.use_cases.data_protection.world:DataProtectionWorldEnvironment",
         help="Dotted path to a BaseWorldEnvironment subclass",
     )
     parser.add_argument(

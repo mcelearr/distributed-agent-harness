@@ -13,6 +13,7 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+# Runtime extras for SDK users.
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
@@ -20,14 +21,28 @@ dev = [
 ]
 
 [dependency-groups]
+# Core dev dependencies — needed to run the SDK test suite.
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
 ]
+# Extra dependencies needed by the bundled examples (the web console
+# example needs FastAPI + uvicorn). Examples are NOT part of the published
+# wheel; this group is for local development of the repo only.
+examples = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+# Discover both the small SDK suite and the per-example tests that live
+# next to each example.
+testpaths = ["tests", "examples"]
+asyncio_mode = "auto"
 
+# Only the SDK ships. `examples/` is intentionally excluded — those are
+# reference implementations, not part of the public package.
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["distributed_agent_harness*", "examples*"]
+include = ["distributed_agent_harness*"]
+exclude = ["examples*", "tests*"]

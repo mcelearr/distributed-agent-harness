@@ -1,0 +1,10 @@
+# worlds.toml — registry of WorldEnvironments visible in the web console.
+#
+# Each entry becomes one row in the dropdown. Adding an example to the
+# console is a one-line config change; no code edits.
+
+[[world]]
+id         = "data-protection"
+name       = "Data Protection (GDPR)"
+class      = "examples.use_cases.data_protection.world:DataProtectionWorldEnvironment"
+project_id = "acme-gdpr-2025"

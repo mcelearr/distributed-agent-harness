@@ -2,7 +2,7 @@
 Data protection demo — walk through the full GDPR engagement lifecycle.
 
 Run with:
-    python -m examples.data_protection.run
+    python -m examples.use_cases.data_protection.run
 """
 from __future__ import annotations
 

@@ -14,7 +14,7 @@ from distributed_agent_harness.adapters import InMemoryNamespace
 from distributed_agent_harness.eventlog import InMemoryEventLog
 from distributed_agent_harness.world import ActionNotAvailable
 
-from examples.data_protection.models import (
+from examples.use_cases.data_protection.models import (
     BreachSeverity,
     BreachStatus,
     DSRStatus,
@@ -22,7 +22,7 @@ from examples.data_protection.models import (
     EngagementStatus,
     PolicyStatus,
 )
-from examples.data_protection.world import DataProtectionWorldEnvironment
+from examples.use_cases.data_protection.world import DataProtectionWorldEnvironment
 
 
 def _now() -> datetime:
