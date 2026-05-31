@@ -2,15 +2,66 @@
 
 ## What is this?
 
-A framework for building **multi-actor agent systems that operate on shared business state**. Multiple humans and multiple agents collaborate on the same project concurrently; every write is typed and auditable; the same code runs end-to-end on a laptop with zero cloud dependencies and deploys unchanged into a Kafka + SharePoint (or Drive, or S3) production environment.
+A framework for building **multi-actor agent systems that operate on shared business state**. Multiple humans and multiple agents collaborate on the same project concurrently.
 
-If you've used Claude Code or Cursor you've seen the classic "single-agent + local filesystem + arbitrary shell" harness pattern. That pattern breaks the moment you try to run a regulated business process on it: state isn't shared, writes aren't audited, two actors can't operate on the same project, and there's no way to gate sensitive operations. DAH keeps what LLMs are good at — navigating filesystems — and replaces what's dangerous with typed actions and event-sourced concurrency.
+Real business processes are **multi-stage and multiplayer** — they run over weeks or months and involve can involve many different actors (increasingly working alongside agents) at different stages. So they need a **shared memory space** — a single project state that every actor, human or agent, reads from and writes to.
+
+The classic harness model — an LLM driving bash over a local filesystem (Claude Code, Cursor, …) — has turned out to be a remarkably good fit for *one* agent on *one* machine. But it breaks the moment you put multiple agents on the same shared state. Two of the ways it breaks, and how DAH fixes them:
+
+#### Standard code harness with shared memory
+
+```mermaid
+flowchart LR
+    subgraph flow [" "]
+        direction TB
+        A1[Agent 1]
+        A2[Agent 2]
+        D[(Shared document)]
+        A1 --> D
+        A2 --> D
+    end
+
+    P["<b>Problems</b><br/><br/><b>1. Race conditions</b><br/>Agents make simultaneous changes on the same document<br/><br/><b>2. No governance</b><br/>Agents make uncontrolled edits, not following correct procedure"]
+
+    flow ~~~ P
+
+    style flow fill:none,stroke:none
+    linkStyle 0 stroke:#c62828,stroke-width:3px
+    linkStyle 1 stroke:#c62828,stroke-width:3px
+    classDef bad fill:#ffebee,stroke:#c62828,color:#000
+    class P bad
+```
+
+#### With Distributed Agent Harness
+
+```mermaid
+flowchart LR
+    subgraph flow [" "]
+        direction TB
+        A1[Agent 1]
+        A2[Agent 2]
+        H[Distributed Agent Harness]
+        D[(Shared document)]
+        A1 --> H
+        A2 --> H
+        H --> D
+    end
+
+    S["<b>Solutions</b><br/><br/><b>1. Concurrency</b><br/>Conflicts are caught and resolved (Agent-as-Rebaser)<br/><br/><b>2. Governance</b><br/>Agents can only call specific actions defined in code; every call is tracked (Code-as-Harness)"]
+
+    flow ~~~ S
+
+    style flow fill:none,stroke:none
+    linkStyle 0 stroke:#2e7d32,stroke-width:3px
+    linkStyle 1 stroke:#2e7d32,stroke-width:3px
+    linkStyle 2 stroke:#2e7d32,stroke-width:3px
+    classDef good fill:#e8f5e9,stroke:#2e7d32,color:#000
+    class H,S good
+```
 
 ## Quick start
 
 The fastest way to try DAH is the bundled **web console** — a browser UI that runs against the example use cases in this repo. Pick one from the dropdown, send chat messages, and watch the agent reason, call typed actions, and update the project namespace.
-
-> The web console is itself an **example** ([`examples/interfaces/web_console/`](examples/interfaces/web_console/)) — not part of the published SDK. It exists so contributors and evaluators have a zero-effort UI to demo with. Production users build their own UI against the public `TriggerSource` / `OutputChannel` interfaces.
 
 ### Prerequisites
 - Python 3.11+
@@ -35,29 +86,9 @@ uv run --env-file .env python -m examples.interfaces.web_console
 
 Then open [http://localhost:8765](http://localhost:8765). The dropdown lists the example use cases registered in [`examples/interfaces/web_console/worlds.toml`](examples/interfaces/web_console/worlds.toml) — today that's the Data Protection / GDPR example; adding more is a one-line config change.
 
-> The `--env-file` flag is `uv`'s built-in way to inject the contents of a `.env` file into the subprocess environment for one command. `.env` itself is git-ignored; only `.env.example` is checked in.
-
-### What else is in the repo
-
-| Path | What it is |
-|---|---|
-| `distributed_agent_harness/` | The SDK — the only thing in the published wheel. |
-| `examples/use_cases/` | `WorldEnvironment` implementations (domain logic). |
-| `examples/interfaces/` | `TriggerSource` / `OutputChannel` adapters (the web console lives here). |
-| `examples/adapters/` | Reserved for future `NamespaceAdapter` / `EventLog` / `MessageBus` examples. |
-| `tests/` | SDK test suite. Per-example tests live next to each example. |
-
-Run any example directly without the LLM:
-
-```bash
-uv run python -m examples.use_cases.data_protection.run
-```
-
----
-
 ## Why DAH
 
-DAH is a positioning bet that there's a class of agent system — multi-actor, regulated, written by domain experts, deployed at company scale — that none of today's harnesses serve. Three platforms sit closest in the field:
+DAH is a positioning bet that there's a class of agent system — multi-actor, regulated, written by domain experts, deployed at company scale — that none of today's harnesses serve. Examples of similar platforms:
 
 - **[Pi Coding Agent](https://pi.dev)** is a Claude Code-style terminal coding agent — a single user working a local repo, with `read` / `write` / `edit` / `bash` as default tools and TypeScript extensions for everything else.
 - **[Microsoft Agent Framework (MAF)](https://github.com/microsoft/agent-framework)** is the production convergence of Semantic Kernel + AutoGen — a polyglot (Python + .NET) framework for graph-based workflows, durable execution, and Azure-hosted multi-agent systems.
