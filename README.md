@@ -4,9 +4,9 @@
 
 A framework for building **multi-actor agent systems that operate on shared business state**. Multiple humans and multiple agents collaborate on the same project concurrently.
 
-Real business processes are **multi-stage and multiplayer** — they run over weeks or months and involve can involve many different actors (increasingly working alongside agents) at different stages. So they need a **shared memory space** — a single project state that every actor, human or agent, reads from and writes to.
+Real business processes are **multi-stage and multiplayer** — they run over weeks or months and involve can involve many different actors (increasingly AI agents as much as humans) at different stages. So they need a **shared memory space** — a single project state that every actor, human or agent, reads from and writes to.
 
-The classic harness model — an LLM driving bash over a local filesystem (Claude Code, Cursor, …) — has turned out to be a remarkably good fit for *one* agent on *one* machine. But it breaks the moment you put multiple agents on the same shared state. Two of the ways it breaks, and how DAH fixes them:
+The classic harness model — an LLM driving bash over a local filesystem (Claude Code, Cursor, …) — has turned out to be a remarkably good fit for *one* agent on *one* machine. But it breaks the moment you put multiple agents on the same shared state.
 
 #### Standard code harness with shared memory
 
