@@ -22,6 +22,19 @@ All three are pure functions over ``NamespaceAdapter``. They are reused by
 the runtime (as built-in meta-tools the LLM sees), by future CLI
 helpers, and by other agents inspecting the project over A2A — same
 single-source-of-truth pattern as ``event_search``.
+
+Spotlighting (Zero Trust indirect-injection defence)
+----------------------------------------------------
+``render_read`` and ``render_grep`` wrap content from *untrusted* sources
+in ``<untrusted source="<path>">…</untrusted>`` blocks. The system
+prompt instructs the LLM to treat anything inside those tags as data,
+not instructions. A doc is considered trusted iff it sits at one of the
+canonical paths the harness itself writes (``state.json``,
+``summary.md``, ``event_log.md``, ``audit.jsonl``); everything else —
+artefacts produced by subagents, files dropped in by humans, binary
+uploads — is wrapped. The rule is conservative on purpose: the cost of
+a false-positive wrap is a slightly noisier prompt, the cost of a
+false-negative is a successful indirect prompt injection.
 """
 from __future__ import annotations
 
@@ -204,8 +217,52 @@ def read_doc(
     }
 
 
+#: Document basenames the harness writes itself. Anything else is wrapped
+#: in spotlighting tags before being shown to the LLM.
+_TRUSTED_DOC_BASENAMES: frozenset[str] = frozenset({
+    "state.json", "summary.md", "event_log.md", "audit.jsonl",
+})
+
+
+def is_trusted_path(path: str) -> bool:
+    """Return True iff ``path`` is one of the harness's own canonical docs.
+
+    The check matches by basename — every project has its own copy under
+    ``<project_id>/<basename>``. Adapters that store docs at slightly
+    different layouts still match correctly so long as the basename
+    matches a canonical doc.
+    """
+    basename = path.rsplit("/", 1)[-1]
+    return basename in _TRUSTED_DOC_BASENAMES
+
+
+def _spotlight(content: str, path: str) -> str:
+    """Wrap untrusted content in tagged blocks for indirect-injection safety.
+
+    Tag pair: ``<untrusted source="<path>">…</untrusted>``. The system
+    prompt explains the convention to the LLM. We strip any existing
+    matching close-tag in the content so a malicious doc cannot escape
+    the wrapper.
+    """
+    # Sanitise the source attribute and any literal close-tag inside the
+    # body — both prevent an attacker from forging an escape sequence.
+    safe_path = path.replace('"', "%22")
+    safe_body = content.replace("</untrusted>", "&lt;/untrusted&gt;")
+    return (
+        f'<untrusted source="{safe_path}">\n'
+        f"{safe_body}\n"
+        f"</untrusted>"
+    )
+
+
 def render_read(content: str | None, path: str, meta: dict) -> str:
-    """Human-readable rendering for the LLM-facing TOOL message."""
+    """Human-readable rendering for the LLM-facing TOOL message.
+
+    Content from untrusted sources is wrapped in
+    ``<untrusted source="<path>">…</untrusted>`` per the spotlighting
+    convention; the system prompt explains how the LLM should treat it.
+    """
+    trusted = is_trusted_path(path)
     if meta.get("binary"):
         mime = meta.get("mime") or "application/octet-stream"
         size = _format_size(int(meta.get("size") or 0))
@@ -215,6 +272,8 @@ def render_read(content: str | None, path: str, meta: dict) -> str:
         if sha_short:
             bits.append(sha_short)
         descriptor = " | ".join(bits)
+        # Binary content is described but not rendered — there's nothing
+        # injectable in the descriptor itself, so no wrap needed.
         return (
             f"[{descriptor}]\n\n"
             "_Binary content is not rendered inline. The descriptor above "
@@ -228,14 +287,15 @@ def render_read(content: str | None, path: str, meta: dict) -> str:
             f"_(offset past end of file — `{path}` has "
             f"{meta.get('total_lines', 0)} lines)_"
         )
-    if not meta.get("truncated"):
-        return content
-    return (
+    body = content if not meta.get("truncated") else (
         f"{content}\n\n"
         f"[Showing lines {meta['first_line']}-{meta['last_line']} of "
         f"{meta['total_lines']}. Call `read` again with "
         f"`offset={meta['last_line'] + 1}` to continue.]"
     )
+    if trusted:
+        return body
+    return _spotlight(body, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -287,13 +347,40 @@ def grep_docs(
 
 
 def render_grep(matches: list[GrepMatch], limit: int = DEFAULT_GREP_LIMIT) -> str:
-    """Human-readable rendering of grep results."""
+    """Human-readable rendering of grep results.
+
+    Matches from trusted canonical docs are rendered inline as before.
+    Matches from untrusted docs are grouped per-path and wrapped in
+    ``<untrusted source="<path>">…</untrusted>`` blocks so the LLM
+    cannot mistake injected content in a hit line for an instruction.
+    """
     if not matches:
         return "_(no matches)_"
-    lines = [f"{m.path}:{m.line_number}: {m.line}" for m in matches]
+
+    trusted_lines: list[str] = []
+    # Preserve discovery order per path; group untrusted hits together.
+    untrusted_by_path: dict[str, list[str]] = {}
+    untrusted_order: list[str] = []
+    for m in matches:
+        line = f"{m.path}:{m.line_number}: {m.line}"
+        if is_trusted_path(m.path):
+            trusted_lines.append(line)
+        else:
+            if m.path not in untrusted_by_path:
+                untrusted_by_path[m.path] = []
+                untrusted_order.append(m.path)
+            untrusted_by_path[m.path].append(line)
+
+    sections: list[str] = []
+    if trusted_lines:
+        sections.append("\n".join(trusted_lines))
+    for path in untrusted_order:
+        block_body = "\n".join(untrusted_by_path[path])
+        sections.append(_spotlight(block_body, path))
+
     if len(matches) >= limit:
-        lines.append(f"\n[Hit limit={limit}; raise `limit` to see more matches.]")
-    return "\n".join(lines)
+        sections.append(f"[Hit limit={limit}; raise `limit` to see more matches.]")
+    return "\n".join(sections)
 
 
 # --------------------------------------------------------------------------- #

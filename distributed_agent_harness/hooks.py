@@ -29,10 +29,84 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 if TYPE_CHECKING:
+    from .identity import AgentIdentity
     from .llm import Message
     from .transport import TriggerEvent
 
 log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Run budget                                                                   #
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class RunBudget:
+    """Per-run cap on what a single ``TriggerEvent`` is allowed to spend.
+
+    A fresh ``RunBudget`` is constructed at the top of ``AgentRuntime.handle``
+    and passed through ``ActionContext.budget`` / ``SubagentContext.budget``
+    so policy hooks can observe (or extend) the limits.
+
+    Counters are incremented by the runtime *before* each call is
+    dispatched. ``check_action`` / ``check_subagent`` return a
+    ``BlockDecision`` when the next call would exceed the cap; the runtime
+    surfaces that to the LLM as a blocked TOOL message, identical in shape
+    to a user-defined ``pre_action`` block. The LLM can then choose to
+    explain the limit to the user rather than thrashing.
+
+    Defaults are deliberately generous — DAH ships sensible safety rails,
+    not a hard production policy. Tune at construction time::
+
+        runtime = AgentRuntime(...)
+        @runtime.on_pre_trigger
+        async def shrink_budget(event):
+            event.budget = RunBudget(action_limit=5, subagent_limit=1)
+
+    Attributes
+    ----------
+    action_limit:
+        Max @action calls per run. ``None`` disables the check.
+    subagent_limit:
+        Max ``consult_<name>`` calls per run. ``None`` disables the check.
+    """
+    action_limit: int | None = 50
+    subagent_limit: int | None = 10
+    action_count: int = 0
+    subagent_count: int = 0
+
+    def record_action(self) -> None:
+        self.action_count += 1
+
+    def record_subagent(self) -> None:
+        self.subagent_count += 1
+
+    def check_action(self) -> "BlockDecision | None":
+        """Return a BlockDecision if the next action would exceed the cap."""
+        if self.action_limit is None:
+            return None
+        if self.action_count >= self.action_limit:
+            return BlockDecision(
+                reason=(
+                    f"Run budget exceeded: {self.action_count} actions "
+                    f"already executed in this run (cap={self.action_limit}). "
+                    "Stop calling actions and report back to the user."
+                )
+            )
+        return None
+
+    def check_subagent(self) -> "BlockDecision | None":
+        """Return a BlockDecision if the next subagent call would exceed the cap."""
+        if self.subagent_limit is None:
+            return None
+        if self.subagent_count >= self.subagent_limit:
+            return BlockDecision(
+                reason=(
+                    f"Run budget exceeded: {self.subagent_count} subagent "
+                    f"consults already issued (cap={self.subagent_limit})."
+                )
+            )
+        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -46,12 +120,25 @@ class ActionContext:
 
     Hooks receive enough information to make policy decisions and route
     notifications without needing to dig into runtime internals.
+
+    ``identity`` is the caller's :class:`AgentIdentity` (set by the runtime
+    from the triggering event; ``None`` only for legacy code paths and
+    standalone @action calls).
+
+    ``trigger_id`` is the originating ``TriggerEvent.id`` — convenient for
+    hooks that log to external systems with their own correlation ids.
+
+    ``budget`` is the per-run :class:`RunBudget`. Read it to enforce
+    additional policy, mutate it to tighten or loosen caps mid-run.
     """
     project_id: str
     action_name: str
     args: tuple[Any, ...] = ()
     kwargs: dict[str, Any] = field(default_factory=dict)
     trigger: "TriggerEvent | None" = None   # the TriggerEvent that led here, if any
+    identity: "AgentIdentity | None" = None
+    trigger_id: str | None = None
+    budget: "RunBudget | None" = None
 
 
 @dataclass
@@ -66,6 +153,9 @@ class SubagentContext:
     message: str
     session_id: str | None = None
     trigger: "TriggerEvent | None" = None
+    identity: "AgentIdentity | None" = None
+    trigger_id: str | None = None
+    budget: "RunBudget | None" = None
 
 
 @dataclass(frozen=True)
