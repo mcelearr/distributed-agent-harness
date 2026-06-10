@@ -2,7 +2,7 @@
 
 ## What is this?
 
-**[Distributed Agent Harness explainer presentation]**(https://mcelearr.github.io/distributed-agent-harness)
+[**Distributed Agent Harness explainer presentation**](https://mcelearr.github.io/distributed-agent-harness)
 
 A framework for building **multi-actor agent systems that operate on shared business state**. Multiple humans and multiple agents collaborate on the same project concurrently.
 
