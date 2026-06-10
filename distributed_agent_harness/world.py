@@ -29,6 +29,7 @@ from pydantic import BaseModel
 
 from .conflict import ConcurrentUpdate
 from .eventlog import Appended, Conflict, Event, EventLog
+from .identity import AgentIdentity
 from .namespace import NamespaceAdapter
 
 if TYPE_CHECKING:
@@ -193,13 +194,19 @@ def action(
                 raise
 
             # Append the event. CAS via expected_offset.
+            identity: AgentIdentity | None = getattr(self, "_identity", None)
+            trigger = getattr(self, "_pending_trigger", None)
+            trigger_id = getattr(trigger, "id", None) if trigger is not None else None
+            actor = identity.label if identity is not None else getattr(self, "_actor", "agent")
             event = Event(
                 project_id=self._project_id,
                 action_name=target_method.__name__,
                 args=[_serialisable(a) for a in args],
                 kwargs={k: _serialisable(v) for k, v in kwargs.items()},
-                actor=getattr(self, "_actor", "agent"),
+                actor=actor,
                 result_summary=_summarise_result(result),
+                identity=identity,
+                trigger_id=trigger_id,
             )
             append_result = _run_sync(self._eventlog.append(
                 self._project_id, event, expected_offset=self._last_seen_offset,
@@ -293,7 +300,16 @@ class BaseWorldEnvironment:
         namespace: NamespaceAdapter,
         eventlog: EventLog,
         actor: str = "agent",
+        identity: AgentIdentity | None = None,
     ) -> None:
+        """Initialise the world for a single project.
+
+        ``actor`` is the legacy free-form attribution string. ``identity``
+        is the structured replacement; when supplied it takes precedence
+        (``Event.actor`` is derived from ``identity.label`` so the legacy
+        log-search path keeps working). Passing neither yields an
+        anonymous ``actor="agent"`` event stream — the original default.
+        """
         if not hasattr(self.__class__, "State"):
             raise TypeError(
                 f"{type(self).__name__} must define a 'State' class attribute "
@@ -303,6 +319,7 @@ class BaseWorldEnvironment:
         self._namespace = namespace
         self._eventlog = eventlog
         self._actor = actor
+        self._identity: AgentIdentity | None = identity
         self._pending_trigger: "TriggerEvent | None" = None
         self._last_seen_offset: int = 0
         self.state: BaseModel = self.__class__.State()
@@ -368,6 +385,9 @@ class BaseWorldEnvironment:
     ) -> None:
         """Record one action in both the JSONL audit log and the markdown event log."""
         timestamp = datetime.now(timezone.utc).isoformat()
+        identity: AgentIdentity | None = getattr(self, "_identity", None)
+        trigger = getattr(self, "_pending_trigger", None)
+        trigger_id = getattr(trigger, "id", None) if trigger is not None else None
 
         entry: dict[str, Any] = {
             "timestamp": timestamp,
@@ -376,7 +396,11 @@ class BaseWorldEnvironment:
             "args": [repr(a) for a in args],
             "kwargs": {k: repr(v) for k, v in kwargs.items()},
             "offset": self._last_seen_offset,
+            "actor": identity.label if identity is not None else self._actor,
+            "trigger_id": trigger_id,
         }
+        if identity is not None and identity.pubkey_fingerprint is not None:
+            entry["pubkey_fingerprint"] = identity.pubkey_fingerprint
         if error is not None:
             entry["error"] = error
         else:

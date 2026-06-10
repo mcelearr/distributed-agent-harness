@@ -31,7 +31,8 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from ..eventlog import Appended, Event
-from ..hooks import HookRegistry, SubagentContext
+from ..hooks import HookRegistry, RunBudget, SubagentContext
+from ..identity import AgentIdentity
 from ..llm import Message, Role, ToolCall, ToolSchema
 from ..transport import OutputEvent, OutputEventKind, TriggerEvent
 from .base import (
@@ -131,6 +132,8 @@ async def execute_subagent_call(
     hooks: HookRegistry,
     eventlog: "EventLog",
     namespace: "NamespaceAdapter",
+    identity: AgentIdentity | None = None,
+    budget: RunBudget | None = None,
 ) -> Message:
     """Dispatch one ``consult_<name>`` tool call.
 
@@ -152,6 +155,9 @@ async def execute_subagent_call(
         message=message,
         session_id=session_id_raw if isinstance(session_id_raw, str) else None,
         trigger=trigger,
+        identity=identity,
+        trigger_id=trigger.id,
+        budget=budget,
     )
 
     # ----- pre_subagent_call hook
@@ -180,6 +186,7 @@ async def execute_subagent_call(
         await _append_subagent_event(
             eventlog, world._project_id, subagent_name, message,
             sub_ctx.session_id, status="failed", content=f"timeout: {exc}",
+            identity=identity, trigger_id=trigger.id,
         )
         return await _emit_error_message(
             call, reply_to, f"Subagent timed out: {exc}",
@@ -188,6 +195,7 @@ async def execute_subagent_call(
         await _append_subagent_event(
             eventlog, world._project_id, subagent_name, message,
             sub_ctx.session_id, status="failed", content=str(exc),
+            identity=identity, trigger_id=trigger.id,
         )
         return await _emit_error_message(
             call, reply_to,
@@ -208,6 +216,8 @@ async def execute_subagent_call(
         content=response.content,
         returned_session_id=response.session_id,
         artefact_records=artefact_records,
+        identity=identity,
+        trigger_id=trigger.id,
     )
 
     # ----- post_subagent_call hook
@@ -347,6 +357,8 @@ async def _append_subagent_event(
     content: str,
     returned_session_id: str | None = None,
     artefact_records: list[dict] | None = None,
+    identity: AgentIdentity | None = None,
+    trigger_id: str | None = None,
 ) -> None:
     """Append a ``consult_<name>`` event with transparent CAS retry.
 
@@ -365,6 +377,7 @@ async def _append_subagent_event(
         paths_inline = ", ".join(a["path"] for a in artefact_records)
         summary_parts.append(f"artefacts=[{paths_inline}]")
 
+    actor = identity.label if identity is not None else "agent"
     event = Event(
         project_id=project_id,
         action_name=f"{SUBAGENT_TOOL_PREFIX}{subagent_name}",
@@ -373,8 +386,10 @@ async def _append_subagent_event(
             "message": _truncate_for_log(message),
             "session_id": session_id,
         },
-        actor="agent",
+        actor=actor,
         result_summary=" ".join(summary_parts),
+        identity=identity,
+        trigger_id=trigger_id,
     )
     while True:
         offset = await eventlog.current_offset(project_id)

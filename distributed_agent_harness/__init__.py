@@ -26,10 +26,12 @@ from .namespace_browse import (
 from .eventlog import (
     Appended,
     AppendResult,
+    ChainBreak,
     Conflict,
     Event,
     EventLog,
     InMemoryEventLog,
+    compute_event_hash,
 )
 from .hooks import (
     ActionContext,
@@ -41,9 +43,11 @@ from .hooks import (
     PreActionHook,
     PreSubagentCallHook,
     PreTriggerHook,
+    RunBudget,
     RunCompleteHook,
     SubagentContext,
 )
+from .identity import AgentIdentity
 from .llm import (
     CompletionChunk,
     LLMProvider,
@@ -103,6 +107,10 @@ __all__ = [
     "Appended",
     "Conflict",
     "AppendResult",
+    "ChainBreak",
+    "compute_event_hash",
+    # Identity
+    "AgentIdentity",
     # Conflict resolution
     "ConcurrentUpdate",
     "ConflictContext",
@@ -133,6 +141,7 @@ __all__ = [
     "ActionContext",
     "SubagentContext",
     "BlockDecision",
+    "RunBudget",
     "PreActionHook",
     "PostActionHook",
     "ActionErrorHook",

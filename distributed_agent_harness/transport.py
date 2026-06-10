@@ -14,10 +14,14 @@ present for interactive triggers, absent for pure event-driven ones.
 """
 from __future__ import annotations
 
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
+
+if TYPE_CHECKING:
+    from .identity import AgentIdentity
 
 
 # --------------------------------------------------------------------------- #
@@ -33,12 +37,25 @@ class TriggerKind(str, Enum):
 
 @dataclass
 class TriggerEvent:
-    """An event that may cause an agent run to start."""
+    """An event that may cause an agent run to start.
+
+    ``id`` is the request-id every downstream ``Event`` references via
+    ``Event.trigger_id`` — letting an investigator filter ``audit.jsonl``
+    down to a single triggering request chain. Defaults to a fresh uuid
+    hex so callers don't have to set it explicitly; pass an explicit value
+    when correlating with an upstream system's own trace id.
+
+    ``identity`` is the principal that fired this trigger. When ``None``
+    the runtime substitutes ``AgentIdentity.anonymous_agent()`` so the
+    no-config use case stays one-liner.
+    """
     source: str                           # e.g. "cli", "http", "sharepoint"
     kind: TriggerKind
     payload: dict[str, Any]                # free-form per-source data
     project_id: str                        # which WorldEnvironment to act on
     reply_to: "OutputChannel | None" = None  # optional streaming back-channel
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    identity: "AgentIdentity | None" = None
 
 
 class TriggerSource(ABC):
