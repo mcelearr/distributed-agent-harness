@@ -166,6 +166,18 @@ table.cmp tr td:nth-child(2){background:rgba(91,209,255,0.06)}
 .dp-packet.red{background:rgba(251,113,133,0.16);color:var(--red);border:1px solid var(--red)}
 .dp-packet.conflict{animation:dpshake .28s 2}
 @keyframes dpshake{0%,100%{transform:translate(-50%,-50%)}25%{transform:translate(-50%,-50%) rotate(-4deg)}75%{transform:translate(-50%,-50%) rotate(4deg)}}
+.dp-we{position:absolute;border:1.5px dashed rgba(242,181,68,0.55);border-radius:14px;
+  background:rgba(242,181,68,0.05);z-index:2}
+.dp-we-tab{position:absolute;top:-12px;left:16px;font-family:'JetBrains Mono';font-size:11px;
+  letter-spacing:0.5px;color:var(--gold);background:#141B30;border:1px solid rgba(242,181,68,0.45);
+  border-radius:7px;padding:2px 9px;white-space:nowrap}
+.dp-we-cap{position:absolute;font-family:'Inter';font-size:11.5px;font-style:italic;color:var(--gold);text-align:center}
+.dp-readbus-h{position:absolute;border-top:1.5px dashed rgba(91,209,255,0.45)}
+.dp-readbus-v{position:absolute;border-left:1.5px dashed rgba(91,209,255,0.45)}
+.dp-readlabel{position:absolute;font-family:'JetBrains Mono';font-size:10.5px;color:var(--cyan);
+  background:var(--bg2);padding:1px 8px;border-radius:6px;white-space:nowrap;transform:translateX(-50%)}
+.dp-readdot{position:absolute;top:6px;width:9px;height:9px;border-radius:50%;background:var(--cyan);
+  box-shadow:0 0 11px var(--cyan);transform:translate(-50%,-50%);transition:left .8s linear,opacity .3s;z-index:5}
 </style>
 </head>
 <body>
@@ -286,6 +298,15 @@ S(`
       <div class="dp-conn" style="left:320px;top:62px;height:52px"></div>
       <div class="dp-conn" style="left:769px;top:180px;height:54px"></div>
 
+      <!-- read path: namespace feeds the prompt builder every turn -->
+      <div class="dp-readbus-v" style="left:985px;top:6px;height:108px"></div>
+      <div class="dp-readbus-h" style="left:320px;width:665px;top:6px"></div>
+      <div class="dp-readbus-v" style="left:320px;top:6px;height:9px"></div>
+      <div class="dp-readlabel" style="left:652px;top:13px">PromptBuilder reads each turn: state · summary · event log · audit</div>
+
+      <div class="dp-we" style="left:470px;top:82px;width:216px;height:134px"><div class="dp-we-tab">World Environment</div></div>
+      <div class="dp-we-cap" style="left:470px;width:216px;top:224px">↑ the part the developer writes</div>
+
       <div class="dp-node" id="dp-src" style="left:6px;top:122px;width:150px">
         <div class="nt">Trigger</div><div class="ns">breach · DSR · partner</div></div>
       <div class="dp-node hub" id="dp-runtime" style="left:235px;top:114px;width:170px">
@@ -307,7 +328,7 @@ S(`
   </div>
 </div>`);
 
-/* ───────────────────────── 6 — NAMESPACE ───────────────────────── */
+/* ───────────────────────── 5 — NAMESPACE ───────────────────────── */
 S(`
 <div class="kicker"><span class="num">// 05</span> <span class="dot"></span> Component 1 · Project namespace</div>
 <h1>One client = one folder of readable docs</h1>
@@ -386,6 +407,43 @@ class AgentIdentity:
         <p style="font-size:14px">Any post-hoc edit to a client's breach log surfaces at the <span class="hl-green">exact offset</span> it happened — on any backend, because the logic lives on the ABC <span class="hl-cyan">(F3 · F10)</span>.</p>
       </div>
     </div>
+  </div>
+</div>`);
+
+/* ───────────────────────── 7 — GENERATION (from docs) ───────────────────────── */
+S(`
+<div class="kicker"><span class="num">// 07</span> <span class="dot"></span> Generation</div>
+<h1>Generate the <span style="color:var(--muted);font-weight:500">(first version of the)</span> World Environment from docs</h1>
+<div class="sub">Claude reads the firm's documents <i>and</i> the harness code, then fills in the business logic — the orchestration layer already exists.</div>
+<div class="body">
+  <div class="row center" style="gap:12px;align-items:stretch">
+    <div class="card tight" style="flex:1">
+      <h3><span class="icoCircle ic-gold">①</span> Drop in the domain documents</h3>
+      <p style="margin-bottom:10px">Claude Code is great at reading large volumes of unstructured data:</p>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        <span class="offtag">PDF</span><span class="offtag">Excel</span><span class="offtag">emails</span>
+        <span class="offtag">memos</span><span class="offtag">legal documentation</span>
+      </div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="card tight" style="flex:1">
+      <h3><span class="icoCircle ic-cyan">②</span> Claude reads the harness</h3>
+      <p>It sees the <b style="color:var(--ink)">code</b> of the agent harness and understands how to generate the <code class="inl">WorldEnvironment</code>.</p>
+    </div>
+    <div class="arrow">→</div>
+    <div class="card tight" style="flex:1">
+      <h3><span class="icoCircle ic-green">③</span> Fill in the business logic</h3>
+      <p>It never has to <b style="color:var(--ink)">improvise the orchestration layer</b> — that's provided. It just encodes the firm's rules.</p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <h3><span class="icoCircle ic-purple">◆</span> Code is the substrate of business-process documentation</h3>
+    <ul class="clean" style="margin-top:12px;gap:13px">
+      <li><b>Claude loves to write code</b> <span class="m">— the harness hands it a typed target, not a blank canvas.</span></li>
+      <li><b>Claude loves to read &amp; explain code</b> <span class="m">— come back to logic you wrote six months ago, or pick up a colleague's, and Claude explains exactly what it does.</span></li>
+      <li><b>Claude loves to write unit tests</b> <span class="m">— and to run complex end-to-end scenarios across many variations, all provable because the logic is deterministic.</span></li>
+    </ul>
   </div>
 </div>`);
 
@@ -702,16 +760,32 @@ async function dpSpawn(){
   p.style.left=wp[3]+'px'; await dpWait(660); dpGlow('dp-log');
   if(conflict){ dpGlow('dp-cr','glow'); p.classList.add('conflict'); await dpWait(820); p.classList.remove('conflict'); }
   else { await dpWait(340); }
-  p.style.left=wp[4]+'px'; await dpWait(660); dpGlow('dp-ns','glow-g');
+  p.style.left=wp[4]+'px'; await dpWait(660); dpGlow('dp-ns','glow-g'); dpReadPulse();
   await dpWait(280); p.style.opacity='0';
   await dpWait(420); p.remove();
 }
+// The write just landed in the namespace; the next prompt is rebuilt from it.
+// A read-dot flows back along the top bus into the PromptBuilder.
+async function dpReadPulse(){
+  const track=document.getElementById('dp-track'); if(!track||!dpRunning)return;
+  const nsX=dpCenter('dp-ns'), pbX=dpCenter('dp-pb');
+  const d=document.createElement('div'); d.className='dp-readdot';
+  d.style.left=nsX+'px'; d.style.opacity='0'; track.appendChild(d);
+  await dpWait(40); if(!d.isConnected)return; d.style.opacity='1';
+  await dpWait(120); d.style.left=pbX+'px'; await dpWait(820);
+  dpGlow('dp-pb','glow');
+  await dpWait(160); d.style.opacity='0';
+  await dpWait(360); d.remove();
+}
 function dpStart(){ if(dpRunning)return; dpRunning=true; dpIdx=0; dpCount=0; dpSpawn(); dpTimer=setInterval(dpSpawn,2100); }
 function dpStop(){ dpRunning=false; clearInterval(dpTimer); dpTimer=null;
-  const t=document.getElementById('dp-track'); if(t) t.querySelectorAll('.dp-packet').forEach(e=>e.remove()); }
+  const t=document.getElementById('dp-track'); if(t) t.querySelectorAll('.dp-packet,.dp-readdot').forEach(e=>e.remove()); }
 
 let cur = 0;
 const secs = [...document.querySelectorAll('.slide')];
+// Auto-number kickers from slide order so inserts/removes never desync labels.
+// Slide 0 (title) keeps its custom "// technical spike" tag.
+secs.forEach((s,i)=>{ if(i>0){ const n=s.querySelector('.kicker .num'); if(n) n.textContent='// '+String(i+1).padStart(2,'0'); } });
 function show(n){
   cur = Math.max(0, Math.min(slides.length-1, n));
   secs.forEach((s,i)=>s.classList.toggle('active', i===cur));
