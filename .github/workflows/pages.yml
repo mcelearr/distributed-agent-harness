@@ -1,0 +1,47 @@
+name: Deploy presentation to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "presentation/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Allow the workflow to publish to Pages via OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deploy at a time; newer pushes supersede in-flight ones.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # enablement: true turns on GitHub Pages on first run, so no manual
+      # "Settings -> Pages -> Source" click is needed for a personal repo.
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      # Publish only the self-contained slide deck, not the whole repo.
+      - name: Upload presentation
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: presentation
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
