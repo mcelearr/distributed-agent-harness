@@ -2,6 +2,8 @@
 
 ## What is this?
 
+**[Distributed Agent Harness explainer presentation]**(https://mcelearr.github.io/distributed-agent-harness)
+
 A framework for building **multi-actor agent systems that operate on shared business state**. Multiple humans and multiple agents collaborate on the same project concurrently.
 
 Real business processes are **multi-stage and multiplayer** — they run over weeks or months and involve can involve many different actors (increasingly AI agents as much as humans) at different stages. So they need a **shared memory space** — a single project state that every actor, human or agent, reads from and writes to.
